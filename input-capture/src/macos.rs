@@ -6,7 +6,11 @@ use core_foundation::{
     date::CFTimeInterval,
     number::{CFBooleanRef, kCFBooleanTrue},
     runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes},
-    string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
+    string::{CFString, CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
+};
+use core_foundation_sys::base::Boolean;
+use core_foundation_sys::preferences::{
+    CFPreferencesGetAppBooleanValue, kCFPreferencesAnyApplication,
 };
 use core_graphics::{
     base::{CGError, kCGErrorSuccess},
@@ -31,6 +35,7 @@ use std::{
     sync::{Arc, OnceLock},
     task::{Context, Poll, ready},
     thread::{self},
+    time::{Duration, Instant},
 };
 use tokio::sync::{
     Mutex,
@@ -46,6 +51,55 @@ struct Bounds {
     ymax: f64,
 }
 
+/// Recover the wire scroll value from a session-tap line delta. The tap
+/// observes deltas *after* macOS applied the natural-scrolling flip to real
+/// wheels, so undo it here; the receiving end applies its own preference.
+fn cg_line_scroll_to_wire(delta: i32, natural_scrolling: bool) -> i32 {
+    if natural_scrolling { delta } else { -delta }
+}
+
+/// Reads the system natural-scrolling preference
+/// (`com.apple.swipescrolldirection` in the Apple Global Domain).
+/// The key is absent on a freshly set-up account; natural scrolling
+/// defaults to ON in that case.
+fn read_natural_scrolling() -> bool {
+    let key = CFString::from_static_string("com.apple.swipescrolldirection");
+    let mut exists: Boolean = 0;
+    let value = unsafe {
+        CFPreferencesGetAppBooleanValue(
+            key.as_concrete_TypeRef(),
+            kCFPreferencesAnyApplication,
+            &mut exists,
+        )
+    };
+    if exists != 0 { value != 0 } else { true }
+}
+
+const NATURAL_SCROLL_TTL: Duration = Duration::from_secs(1);
+
+/// TTL cache so momentum scrolling doesn't hit CFPreferences per event.
+#[derive(Debug)]
+struct NaturalScrollCache {
+    cached: Option<(Instant, bool)>,
+}
+
+impl NaturalScrollCache {
+    fn new() -> Self {
+        Self { cached: None }
+    }
+
+    fn get(&mut self) -> bool {
+        match self.cached {
+            Some((at, v)) if at.elapsed() < NATURAL_SCROLL_TTL => v,
+            _ => {
+                let v = read_natural_scrolling();
+                self.cached = Some((Instant::now(), v));
+                v
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct InputCaptureState {
     /// active capture positions
@@ -58,6 +112,8 @@ struct InputCaptureState {
     bounds: Bounds,
     /// current state of modifier keys
     modifier_state: XMods,
+    /// cached natural-scrolling preference of this host
+    natural_scroll: NaturalScrollCache,
 }
 
 #[derive(Debug)]
@@ -78,6 +134,7 @@ impl InputCaptureState {
             enter_position: None,
             bounds: Bounds::default(),
             modifier_state: Default::default(),
+            natural_scroll: NaturalScrollCache::new(),
         };
         res.update_bounds()?;
         Ok(res)
@@ -212,6 +269,7 @@ fn get_events(
     ev: &CGEvent,
     result: &mut Vec<CaptureEvent>,
     modifier_state: &mut XMods,
+    natural_scroll: &mut NaturalScrollCache,
 ) -> Result<(), CaptureError> {
     fn map_pointer_event(ev: &CGEvent) -> PointerEvent {
         PointerEvent::Motion {
@@ -359,6 +417,10 @@ fn get_events(
         CGEventType::ScrollWheel => {
             // CoreGraphics uses the opposite scroll sign from the protocol's
             // wl_pointer/libei convention (positive = down/right).
+            //
+            // Continuous (trackpad) deltas are intentionally NOT compensated
+            // for natural scrolling: the session tap already observes the
+            // content-follows-finger direction the user intends.
             if ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS) != 0 {
                 let v =
                     ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
@@ -384,11 +446,12 @@ fn get_events(
                 const V120_STEPS_PER_LINE: i32 = 120 / LINES_PER_STEP;
                 let v = ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
                 let h = ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
+                let natural = natural_scroll.get();
                 if v != 0 {
                     result.push(CaptureEvent::Input(Event::Pointer(
                         PointerEvent::AxisDiscrete120 {
                             axis: 0, // Vertical
-                            value: -V120_STEPS_PER_LINE * v as i32,
+                            value: V120_STEPS_PER_LINE * cg_line_scroll_to_wire(v as i32, natural),
                         },
                     )));
                 }
@@ -396,7 +459,7 @@ fn get_events(
                     result.push(CaptureEvent::Input(Event::Pointer(
                         PointerEvent::AxisDiscrete120 {
                             axis: 1, // Horizontal
-                            value: -V120_STEPS_PER_LINE * h as i32,
+                            value: V120_STEPS_PER_LINE * cg_line_scroll_to_wire(h as i32, natural),
                         },
                     )));
                 }
@@ -497,11 +560,14 @@ fn create_event_tap<'a>(
         // Are we in a client?
         if let Some(current_pos) = state.current_pos {
             capture_position = Some(current_pos);
+            // reborrow through the guard so the field borrows can split
+            let state = &mut *state;
             get_events(
                 &event_type,
                 cg_ev,
                 &mut res_events,
                 &mut state.modifier_state,
+                &mut state.natural_scroll,
             )
             .unwrap_or_else(|e| {
                 log::error!("Failed to get events: {e}");
@@ -901,5 +967,24 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cg_line_scroll_to_wire;
+
+    #[test]
+    fn passes_line_scroll_through_when_natural_scrolling_on() {
+        assert_eq!(cg_line_scroll_to_wire(1, true), 1);
+        assert_eq!(cg_line_scroll_to_wire(-1, true), -1);
+        assert_eq!(cg_line_scroll_to_wire(0, true), 0);
+    }
+
+    #[test]
+    fn inverts_line_scroll_when_natural_scrolling_off() {
+        assert_eq!(cg_line_scroll_to_wire(1, false), -1);
+        assert_eq!(cg_line_scroll_to_wire(-1, false), 1);
+        assert_eq!(cg_line_scroll_to_wire(0, false), 0);
     }
 }
