@@ -10,15 +10,14 @@ use input_capture::{
 };
 use input_event::{Event, KeyboardEvent, scancode};
 use lan_mouse_proto::{ProtoEvent, WireEvent};
-use local_channel::mpsc::{Receiver, Sender, channel};
-use tokio::task::{JoinHandle, spawn_local};
+use tokio::task::spawn_local;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     connect::Connection,
     observability::{self, Timestamp},
     position::{capture_to_proto, ipc_to_capture},
-    task::DropGuard,
+    task::{DropGuard, Receiver, Sender, TaskHandle, channel, send},
 };
 
 /// minimum time between two "releasing capture" warnings, so a peer that is
@@ -26,9 +25,8 @@ use crate::{
 const RELEASE_LOG_DEBOUNCE: Duration = Duration::from_millis(500);
 
 pub(crate) struct Capture {
-    cancellation_token: CancellationToken,
+    task: TaskHandle,
     request_tx: Sender<CaptureRequest>,
-    task: JoinHandle<()>,
     event_rx: Receiver<ICaptureEvent>,
 }
 
@@ -101,27 +99,24 @@ impl Capture {
             switch_started_at: None,
             clipboard_text: None,
         };
-        let task = spawn_local(capture_task.run());
+        let task = TaskHandle::new(cancellation_token, spawn_local(capture_task.run()));
         Self {
-            cancellation_token,
-            request_tx,
             task,
+            request_tx,
             event_rx,
         }
     }
 
     pub(crate) fn reenable(&self) {
-        self.request_tx
-            .send(CaptureRequest::Reenable)
-            .expect("channel closed");
+        send(
+            &self.request_tx,
+            "capture reenable",
+            CaptureRequest::Reenable,
+        );
     }
 
     pub(crate) async fn terminate(&mut self) {
-        self.cancellation_token.cancel();
-        log::debug!("terminating capture");
-        if let Err(e) = (&mut self.task).await {
-            log::warn!("{e}");
-        }
+        self.task.terminate("input capture").await;
     }
 
     pub(crate) fn create(
@@ -131,35 +126,44 @@ impl Capture {
         capture_type: CaptureType,
     ) {
         let pos = ipc_to_capture(pos);
-        self.request_tx
-            .send(CaptureRequest::Create(handle, pos, capture_type))
-            .expect("channel closed");
+        send(
+            &self.request_tx,
+            "capture create",
+            CaptureRequest::Create(handle, pos, capture_type),
+        );
     }
 
     pub(crate) fn destroy(&self, handle: CaptureHandle) {
-        self.request_tx
-            .send(CaptureRequest::Destroy(handle))
-            .expect("channel closed");
+        send(
+            &self.request_tx,
+            "capture destroy",
+            CaptureRequest::Destroy(handle),
+        );
     }
 
     pub(crate) fn release(&self) {
-        self.request_tx
-            .send(CaptureRequest::Release)
-            .expect("channel closed");
+        send(&self.request_tx, "capture release", CaptureRequest::Release);
     }
 
-    pub(crate) async fn event(&mut self) -> ICaptureEvent {
-        self.event_rx.recv().await.expect("channel closed")
+    /// The next capture event, or `None` once the capture task has stopped.
+    pub(crate) async fn event(&mut self) -> Option<ICaptureEvent> {
+        self.event_rx.recv().await
     }
 
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
-        let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
+        send(
+            &self.request_tx,
+            "release bind",
+            CaptureRequest::SetReleaseBind(bind),
+        );
     }
 
     pub(crate) fn set_clipboard(&self, text: Option<String>, broadcast: bool) {
-        let _ = self
-            .request_tx
-            .send(CaptureRequest::SetClipboard { text, broadcast });
+        send(
+            &self.request_tx,
+            "clipboard update",
+            CaptureRequest::SetClipboard { text, broadcast },
+        );
     }
 }
 
@@ -235,15 +239,16 @@ impl CaptureTask {
             }
             loop {
                 tokio::select! {
-                    r = self.request_rx.recv() => match r.expect("channel closed") {
-                        CaptureRequest::Reenable => break,
-                        CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
-                        CaptureRequest::Destroy(h) => self.remove_capture(h),
-                        CaptureRequest::Release => { /* nothing to do */ }
-                        CaptureRequest::SetReleaseBind(bind) => {
+                    r = self.request_rx.recv() => match r {
+                        None => return,
+                        Some(CaptureRequest::Reenable) => break,
+                        Some(CaptureRequest::Create(h, p, t)) => self.add_capture(h, p, t),
+                        Some(CaptureRequest::Destroy(h)) => self.remove_capture(h),
+                        Some(CaptureRequest::Release) => { /* nothing to do */ }
+                        Some(CaptureRequest::SetReleaseBind(bind)) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
-                        CaptureRequest::SetClipboard { text, .. } => {
+                        Some(CaptureRequest::SetClipboard { text, .. }) => {
                             self.clipboard_text = text;
                         }
                     },
@@ -302,13 +307,15 @@ impl CaptureTask {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
                 },
-                (handle, event) = self.conn.recv() => {
+                Some((handle, event)) = self.conn.recv() => {
                     let event = match event {
                         WireEvent::Protocol(event) => event,
                         WireEvent::ClipboardText(text) => {
-                            self.event_tx
-                                .send(ICaptureEvent::ClipboardText(text))
-                                .expect("channel closed");
+                            send(
+                                &self.event_tx,
+                                "remote clipboard text",
+                                ICaptureEvent::ClipboardText(text),
+                            );
                             continue;
                         }
                     };
@@ -335,21 +342,22 @@ impl CaptureTask {
                         _ => {}
                     }
                 },
-                e = self.request_rx.recv() => match e.expect("channel closed") {
-                    CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Release => self.release_capture(capture).await?,
-                    CaptureRequest::Create(h, p, t) => {
+                e = self.request_rx.recv() => match e {
+                    None => return Ok(()),
+                    Some(CaptureRequest::Reenable) => { /* already active */ },
+                    Some(CaptureRequest::Release) => self.release_capture(capture).await?,
+                    Some(CaptureRequest::Create(h, p, t)) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
                     }
-                    CaptureRequest::Destroy(h) => {
+                    Some(CaptureRequest::Destroy(h)) => {
                         self.remove_capture(h);
                         capture.destroy(h).await?;
                     }
-                    CaptureRequest::SetReleaseBind(bind) => {
+                    Some(CaptureRequest::SetReleaseBind(bind)) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
-                    CaptureRequest::SetClipboard { text, broadcast } => {
+                    Some(CaptureRequest::SetClipboard { text, broadcast }) => {
                         self.clipboard_text = text;
                         if broadcast {
                             if let Some(text) = self.clipboard_text.as_deref() {
@@ -387,9 +395,11 @@ impl CaptureTask {
         };
 
         if event == CaptureEvent::Begin {
-            self.event_tx
-                .send(ICaptureEvent::CaptureBegin(handle))
-                .expect("channel closed");
+            send(
+                &self.event_tx,
+                "capture begin",
+                ICaptureEvent::CaptureBegin(handle),
+            );
         }
 
         // enter only capture (for incoming connections)
@@ -409,9 +419,11 @@ impl CaptureTask {
             self.active_client.replace(handle);
             self.switch_started_at = Some(Timestamp::now());
             self.set_state(State::WaitingForAck, "edge_entered");
-            self.event_tx
-                .send(ICaptureEvent::ClientEntered(handle))
-                .expect("channel closed");
+            send(
+                &self.event_tx,
+                "client entered",
+                ICaptureEvent::ClientEntered(handle),
+            );
         }
 
         let opposite_pos = capture_to_proto(pos.opposite());

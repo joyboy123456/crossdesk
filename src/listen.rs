@@ -1,9 +1,8 @@
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use lan_mouse_proto::{
     CAPABILITY_CLIPBOARD_TEXT, MAX_EVENT_SIZE, MAX_WIRE_SIZE, ProtoEvent, WireEvent,
     decode_wire_event, encode_clipboard_text,
 };
-use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
     collections::{HashMap, VecDeque},
@@ -13,10 +12,8 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::{
-    sync::Mutex as AsyncMutex,
-    task::{JoinHandle, spawn_local},
-};
+use tokio::{sync::Mutex as AsyncMutex, task::spawn_local};
+use tokio_util::sync::CancellationToken;
 use webrtc_dtls::{
     config::{ClientAuthType::RequireAnyClientCert, Config, ExtendedMasterSecretType},
     conn::DTLSConn,
@@ -29,6 +26,7 @@ use crate::{
     crypto,
     observability::{self, Timestamp},
     peer::PeerCapabilities,
+    task::{Receiver, Sender, TaskHandle, channel, send},
 };
 
 /// How long `accept()` may be awaited before the select loop goes around
@@ -66,8 +64,7 @@ pub(crate) enum ListenEvent {
 
 pub(crate) struct DtlsListener {
     listen_rx: Receiver<ListenEvent>,
-    listen_tx: Sender<ListenEvent>,
-    listen_task: JoinHandle<()>,
+    listen_task: TaskHandle,
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
@@ -140,24 +137,30 @@ impl DtlsListener {
 
         let conns_clone = conns.clone();
         let peer_capabilities_clone = peer_capabilities.clone();
-        let listen_task: JoinHandle<()> = {
+        let cancellation_token = CancellationToken::new();
+        let listen_task = {
             let listen_tx = listen_tx.clone();
             let connection_attempts = connection_attempts.clone();
+            let cancellation_token = cancellation_token.clone();
             spawn_local(async move {
                 loop {
                     let sleep = tokio::time::sleep(ACCEPT_POLL_INTERVAL);
                     tokio::select! {
+                        _ = cancellation_token.cancelled() => return,
                         _ = sleep => continue,
                         c = listener.accept() => match c {
                             Ok((conn, addr)) => {
                                 log::info!("dtls client connected, ip: {addr}");
                                 let mut conns = conns_clone.lock().await;
                                 conns.push((addr, conn.clone()));
-                                let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
-                                let certs = dtls_conn.connection_state().await.peer_certificates;
-                                let cert = certs.first().expect("cert");
-                                let fingerprint = crypto::generate_fingerprint(cert);
-                                listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
+                                // This runs after the peer authenticated, so a
+                                // certificate is expected - but dropping one
+                                // connection beats aborting the service.
+                                let Some(fingerprint) = peer_fingerprint(&conn).await else {
+                                    log::warn!("could not read the certificate of {addr}");
+                                    continue;
+                                };
+                                send(&listen_tx, "accepted connection", ListenEvent::Accept { addr, fingerprint });
                                 spawn_local(read_loop(
                                     conns_clone.clone(),
                                     addr,
@@ -172,7 +175,7 @@ impl DtlsListener {
                                         match e {
                                             webrtc_dtls::Error::ErrVerifyDataMismatch => {
                                                 if let Some(fingerprint) = connection_attempts.lock().unwrap_or_else(PoisonError::into_inner).pop_front() {
-                                                    listen_tx.send(ListenEvent::Rejected { fingerprint }).expect("channel closed");
+                                                    send(&listen_tx, "rejected connection", ListenEvent::Rejected { fingerprint });
                                                 }
                                             }
                                             _ => log::warn!("accept: {e}"),
@@ -186,17 +189,19 @@ impl DtlsListener {
                             }
                         },
                         port = request_port_change_rx.recv() => {
-                            let port = port.expect("channel closed");
+                            let Some(port) = port else {
+                                return;
+                            };
                             let listen_addr = SocketAddr::from((LISTEN_IP, port));
                             match listen(listen_addr, cfg.clone()).await {
                                 Ok(new_listener) => {
                                     let _ = listener.close().await;
                                     listener = new_listener;
-                                    port_changed_tx.send(Ok(port)).expect("channel closed");
+                                    send(&port_changed_tx, "port change result", Ok(port));
                                 }
                                 Err(e) => {
                                     log::warn!("unable to change port: {e}");
-                                    port_changed_tx.send(Err(e.into())).expect("channel closed");
+                                    send(&port_changed_tx, "port change error", Err(e.into()));
                                 }
                             };
                         },
@@ -208,8 +213,7 @@ impl DtlsListener {
         Ok(Self {
             conns,
             listen_rx,
-            listen_tx,
-            listen_task,
+            listen_task: TaskHandle::new(cancellation_token, listen_task),
             port_changed,
             request_port_change,
             peer_capabilities,
@@ -217,20 +221,24 @@ impl DtlsListener {
     }
 
     pub(crate) fn request_port_change(&mut self, port: u16) {
-        self.request_port_change.send(port).expect("channel closed");
+        send(&self.request_port_change, "port change request", port);
     }
 
-    pub(crate) async fn port_changed(&mut self) -> Result<u16, ListenerCreationError> {
-        self.port_changed.recv().await.expect("channel closed")
+    /// The outcome of a requested port change, or `None` if the listener
+    /// stopped before it could report one.
+    pub(crate) async fn port_changed(&mut self) -> Option<Result<u16, ListenerCreationError>> {
+        self.port_changed.recv().await
     }
 
     pub(crate) async fn terminate(&mut self) {
-        self.listen_task.abort();
+        self.listen_task.terminate("dtls listener").await;
         let conns = self.conns.lock().await;
         for (_, conn) in conns.iter() {
             let _ = conn.close().await;
         }
-        self.listen_tx.close();
+        // Ends the event stream: the read loops can no longer queue events and
+        // anything still buffered is dropped.
+        self.listen_rx.close();
     }
 
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
@@ -292,23 +300,25 @@ impl DtlsListener {
     }
 
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
-        if let Some(conn) = self
+        let conn = self
             .conns
             .lock()
             .await
             .iter()
             .find(|(a, _)| *a == addr)
-            .map(|(_, c)| c.clone())
-        {
-            let conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
-            let certs = conn.connection_state().await.peer_certificates;
-            let cert = certs.first()?;
-            let fingerprint = crypto::generate_fingerprint(cert);
-            Some(fingerprint)
-        } else {
-            None
-        }
+            .map(|(_, c)| c.clone())?;
+        peer_fingerprint(&conn).await
     }
+}
+
+/// SHA-256 fingerprint of the certificate the peer authenticated with.
+///
+/// `None` if the connection is not DTLS or presented no certificate; both mean
+/// we cannot identify the peer, not that the process should stop.
+async fn peer_fingerprint(conn: &ArcConn) -> Option<String> {
+    let dtls_conn: &DTLSConn = conn.as_any().downcast_ref()?;
+    let certs = dtls_conn.connection_state().await.peer_certificates;
+    Some(crypto::generate_fingerprint(certs.first()?))
 }
 
 impl Stream for DtlsListener {
@@ -318,7 +328,7 @@ impl Stream for DtlsListener {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.listen_rx.poll_next_unpin(cx)
+        self.listen_rx.poll_recv(cx)
     }
 }
 
@@ -338,13 +348,15 @@ async fn read_loop(
                 if let WireEvent::Protocol(event) = &event {
                     observability::record_received(event);
                 }
-                dtls_tx
-                    .send(ListenEvent::Msg {
+                send(
+                    &dtls_tx,
+                    "received event",
+                    ListenEvent::Msg {
                         event,
                         addr,
                         received_at,
-                    })
-                    .expect("channel closed")
+                    },
+                )
             }
             Err(e) => {
                 // Skip the malformed/unknown datagram and keep

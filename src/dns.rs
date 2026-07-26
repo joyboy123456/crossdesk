@@ -1,16 +1,16 @@
 use std::{collections::HashMap, io, net::IpAddr};
 
-use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::net::lookup_host;
-use tokio::task::{JoinHandle, spawn_local};
+use tokio::task::spawn_local;
 
 use tokio_util::sync::CancellationToken;
 
 use lan_mouse_ipc::ClientHandle;
 
+use crate::task::{Receiver, Sender, TaskHandle, channel, send};
+
 pub(crate) struct DnsResolver {
-    cancellation_token: CancellationToken,
-    task: Option<JoinHandle<()>>,
+    task: TaskHandle,
     request_tx: Sender<DnsRequest>,
     event_rx: Receiver<DnsEvent>,
 }
@@ -29,7 +29,7 @@ struct DnsTask {
     request_rx: Receiver<DnsRequest>,
     event_tx: Sender<DnsEvent>,
     cancellation_token: CancellationToken,
-    active_tasks: HashMap<ClientHandle, JoinHandle<()>>,
+    active_tasks: HashMap<ClientHandle, tokio::task::JoinHandle<()>>,
 }
 
 impl DnsResolver {
@@ -43,9 +43,8 @@ impl DnsResolver {
             event_tx,
             cancellation_token: cancellation_token.clone(),
         };
-        let task = Some(spawn_local(dns_task.run()));
+        let task = TaskHandle::new(cancellation_token, spawn_local(dns_task.run()));
         Ok(Self {
-            cancellation_token,
             task,
             event_rx,
             request_tx,
@@ -53,17 +52,20 @@ impl DnsResolver {
     }
 
     pub(crate) fn resolve(&self, handle: ClientHandle, hostname: String) {
-        let request = DnsRequest { handle, hostname };
-        self.request_tx.send(request).expect("channel closed");
+        send(
+            &self.request_tx,
+            "dns request",
+            DnsRequest { handle, hostname },
+        );
     }
 
-    pub(crate) async fn event(&mut self) -> DnsEvent {
-        self.event_rx.recv().await.expect("channel closed")
+    /// The next resolver event, or `None` once the resolver has stopped.
+    pub(crate) async fn event(&mut self) -> Option<DnsEvent> {
+        self.event_rx.recv().await
     }
 
     pub(crate) async fn terminate(&mut self) {
-        self.cancellation_token.cancel();
-        self.task.take().expect("task").await.expect("join error");
+        self.task.terminate("dns resolver").await;
     }
 }
 
@@ -88,20 +90,20 @@ impl DnsTask {
                 }
             }
 
-            self.event_tx
-                .send(DnsEvent::Resolving(handle))
-                .expect("channel closed");
+            send(&self.event_tx, "dns progress", DnsEvent::Resolving(handle));
 
             /* spawn task for dns request */
             let event_tx = self.event_tx.clone();
             let cancellation_token = self.cancellation_token.clone();
 
-            let task = tokio::task::spawn_local(async move {
+            let task = spawn_local(async move {
                 tokio::select! {
                     result = resolve_hostname(&hostname) => {
-                       event_tx
-                           .send(DnsEvent::Resolved(handle, hostname, result))
-                           .expect("channel closed");
+                        send(
+                            &event_tx,
+                            "dns result",
+                            DnsEvent::Resolved(handle, hostname, result),
+                        );
                     }
                     _ = cancellation_token.cancelled() => {},
                 }

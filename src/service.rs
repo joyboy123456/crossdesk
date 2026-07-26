@@ -8,6 +8,7 @@ use crate::{
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{DtlsListener, ListenerCreationError},
+    task::{Receiver, Sender, channel, send},
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
@@ -16,13 +17,13 @@ use lan_mouse_ipc::{
 };
 use lan_mouse_proto::MAX_CLIPBOARD_TEXT_SIZE;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     io,
     net::{IpAddr, SocketAddr},
     sync::{Arc, PoisonError, RwLock},
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::Notify};
+use tokio::{process::Command, signal};
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -55,10 +56,9 @@ pub struct Service {
     port: u16,
     /// the public key fingerprint for (D)TLS
     public_key_fingerprint: String,
-    /// notify for pending frontend events
-    frontend_event_pending: Notify,
     /// frontend events queued for sending
-    pending_frontend_events: VecDeque<FrontendEvent>,
+    frontend_events_tx: Sender<FrontendEvent>,
+    frontend_events_rx: Receiver<FrontendEvent>,
     /// status of input capture (enabled / disabled)
     capture_status: Status,
     /// status of input emulation (enabled / disabled)
@@ -131,6 +131,7 @@ impl Service {
         let port = config.port();
         let clipboard_enabled = config.clipboard_sync();
         let clipboard = ClipboardSync::new(clipboard_enabled);
+        let (frontend_events_tx, frontend_events_rx) = channel();
         let service = Self {
             config,
             capture,
@@ -140,9 +141,9 @@ impl Service {
             authorized_keys,
             public_key_fingerprint,
             client_manager,
-            frontend_event_pending: Default::default(),
+            frontend_events_tx,
+            frontend_events_rx,
             port,
-            pending_frontend_events: Default::default(),
             capture_status: Default::default(),
             emulation_status: Default::default(),
             incoming_conn_info: Default::default(),
@@ -173,14 +174,24 @@ impl Service {
         while !self.shutdown_requested {
             tokio::select! {
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
-                _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
-                event = self.emulation.event() => self.handle_emulation_event(event),
-                event = self.capture.event() => self.handle_capture_event(event),
-                event = self.resolver.event() => self.handle_resolver_event(event),
-                event = self.clipboard.event() => {
-                    if let Some(event) = event {
-                        self.handle_clipboard_event(event);
-                    }
+                Some(event) = self.frontend_events_rx.recv() => {
+                    self.frontend_listener.broadcast(event).await;
+                }
+                event = self.emulation.event() => match event {
+                    Some(event) => self.handle_emulation_event(event),
+                    None => self.subsystem_stopped("input emulation"),
+                },
+                event = self.capture.event() => match event {
+                    Some(event) => self.handle_capture_event(event),
+                    None => self.subsystem_stopped("input capture"),
+                },
+                event = self.resolver.event() => match event {
+                    Some(event) => self.handle_resolver_event(event),
+                    None => self.subsystem_stopped("dns resolver"),
+                },
+                event = self.clipboard.event() => match event {
+                    Some(event) => self.handle_clipboard_event(event),
+                    None => self.subsystem_stopped("clipboard sync"),
                 },
                 changed = self.config.changed() => match changed {
                     Ok(()) => self.handle_config_change(),
@@ -208,10 +219,19 @@ impl Service {
         Ok(())
     }
 
+    /// A subsystem's event channel ended, which only happens once its task is
+    /// gone. Nothing will drive that half of the service anymore, so stop
+    /// rather than spin on a channel that is closed for good.
+    fn subsystem_stopped(&mut self, what: &str) {
+        log::error!("{what} stopped unexpectedly, shutting down");
+        self.shutdown_requested = true;
+    }
+
     fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
-        let request = match request.expect("frontend listener closed") {
-            Ok(r) => r,
-            Err(e) => return log::error!("error receiving request: {e}"),
+        let request = match request {
+            Some(Ok(r)) => r,
+            Some(Err(e)) => return log::error!("error receiving request: {e}"),
+            None => return self.subsystem_stopped("frontend ipc listener"),
         };
         match request {
             FrontendRequest::Activate(handle, active) => {
@@ -322,12 +342,6 @@ impl Service {
             .clone_from(&authorized_keys);
         self.set_clipboard_enabled(self.config.clipboard_sync());
         self.sync_frontend();
-    }
-
-    async fn handle_frontend_pending(&mut self) {
-        while let Some(event) = self.pending_frontend_events.pop_front() {
-            self.frontend_listener.broadcast(event).await;
-        }
     }
 
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
@@ -530,8 +544,7 @@ impl Service {
     }
 
     fn notify_frontend(&mut self, event: FrontendEvent) {
-        self.pending_frontend_events.push_back(event);
-        self.frontend_event_pending.notify_one();
+        send(&self.frontend_events_tx, "frontend event", event);
     }
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {

@@ -3,13 +3,12 @@ use crate::{
     listen::{DtlsListener, ListenEvent, ListenerCreationError},
     observability::{self, Timestamp},
     position::proto_to_ipc,
-    task::DropGuard,
+    task::{DropGuard, Receiver, Sender, TaskHandle, channel, send},
 };
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
 use lan_mouse_proto::{CAPABILITY_CLIPBOARD_TEXT, ProtoEvent, WireEvent};
-use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -17,10 +16,8 @@ use std::{
     rc::Rc,
     time::{Duration, Instant},
 };
-use tokio::{
-    select,
-    task::{JoinHandle, spawn_local},
-};
+use tokio::{select, task::spawn_local};
+use tokio_util::sync::CancellationToken;
 
 /// how often connected peers are checked for liveness
 const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -35,7 +32,7 @@ const REJECTED_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
-    task: JoinHandle<()>,
+    task: TaskHandle,
     request_tx: Sender<EmulationRequest>,
     event_rx: Receiver<EmulationEvent>,
 }
@@ -91,12 +88,12 @@ enum EmulationRequest {
         text: Option<String>,
         broadcast: bool,
     },
-    Terminate,
 }
 
 impl Emulation {
     pub(crate) fn new(backend: Option<input_emulation::Backend>, listener: DtlsListener) -> Self {
-        let emulation_proxy = EmulationProxy::new(backend);
+        let cancellation_token = CancellationToken::new();
+        let emulation_proxy = EmulationProxy::new(backend, cancellation_token.child_token());
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
@@ -105,8 +102,9 @@ impl Emulation {
             request_rx,
             event_tx,
             clipboard_text: None,
+            cancellation_token: cancellation_token.clone(),
         };
-        let task = spawn_local(emulation_task.run());
+        let task = TaskHandle::new(cancellation_token, spawn_local(emulation_task.run()));
         Self {
             task,
             request_tx,
@@ -115,42 +113,45 @@ impl Emulation {
     }
 
     pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
-        self.request_tx
-            .send(EmulationRequest::Release(addr))
-            .expect("channel closed");
+        send(
+            &self.request_tx,
+            "leave notification",
+            EmulationRequest::Release(addr),
+        );
     }
 
     pub(crate) fn reenable(&self) {
-        self.request_tx
-            .send(EmulationRequest::Reenable)
-            .expect("channel closed");
+        send(
+            &self.request_tx,
+            "emulation reenable",
+            EmulationRequest::Reenable,
+        );
     }
 
     pub(crate) fn request_port_change(&self, port: u16) {
-        self.request_tx
-            .send(EmulationRequest::ChangePort(port))
-            .expect("channel closed")
+        send(
+            &self.request_tx,
+            "port change",
+            EmulationRequest::ChangePort(port),
+        );
     }
 
     pub(crate) fn set_clipboard(&self, text: Option<String>, broadcast: bool) {
-        self.request_tx
-            .send(EmulationRequest::SetClipboard { text, broadcast })
-            .expect("channel closed");
+        send(
+            &self.request_tx,
+            "clipboard update",
+            EmulationRequest::SetClipboard { text, broadcast },
+        );
     }
 
-    pub(crate) async fn event(&mut self) -> EmulationEvent {
-        self.event_rx.recv().await.expect("channel closed")
+    /// The next emulation event, or `None` once the listen task has stopped.
+    pub(crate) async fn event(&mut self) -> Option<EmulationEvent> {
+        self.event_rx.recv().await
     }
 
     /// wait for termination
     pub(crate) async fn terminate(&mut self) {
-        log::debug!("terminating emulation");
-        self.request_tx
-            .send(EmulationRequest::Terminate)
-            .expect("channel closed");
-        if let Err(e) = (&mut self.task).await {
-            log::warn!("{e}");
-        }
+        self.task.terminate("input emulation").await;
     }
 }
 
@@ -160,6 +161,7 @@ struct ListenTask {
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
     clipboard_text: Option<String>,
+    cancellation_token: CancellationToken,
 }
 
 impl ListenTask {
@@ -174,9 +176,7 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             WireEvent::ClipboardText(text) => {
-                                self.event_tx
-                                    .send(EmulationEvent::ClipboardText(text))
-                                    .expect("channel closed");
+                                send(&self.event_tx, "remote clipboard text", EmulationEvent::ClipboardText(text));
                             }
                             WireEvent::Protocol(event) => {
                                 log::trace!("{event} <-<-<-<-<- {addr}");
@@ -184,9 +184,9 @@ impl ListenTask {
                                     ProtoEvent::Enter(pos) => {
                                         if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                             log::info!("releasing capture: {addr} entered this device");
-                                            self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                            send(&self.event_tx, "release notification", EmulationEvent::ReleaseNotify);
                                             self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                            self.event_tx.send(EmulationEvent::Entered{addr, pos: proto_to_ipc(pos), fingerprint}).expect("channel closed");
+                                            send(&self.event_tx, "peer entered", EmulationEvent::Entered{addr, pos: proto_to_ipc(pos), fingerprint});
                                         }
                                     }
                                     ProtoEvent::Leave(_) => {
@@ -206,7 +206,7 @@ impl ListenTask {
                                                 self.listener.send_clipboard(addr, text).await;
                                             }
                                         }
-                                        self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                                        send(&self.event_tx, "peer hello", EmulationEvent::PeerHello { addr, commit });
                                     }
                                     _ => {}
                                 }
@@ -214,30 +214,34 @@ impl ListenTask {
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
-                        self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
+                        send(&self.event_tx, "peer connected", EmulationEvent::Connected { addr, fingerprint });
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
                         if rejected_connections.insert(fingerprint.clone(), Instant::now())
                             .is_none_or(|i| i.elapsed() >= REJECTED_REPORT_INTERVAL) {
-                                self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
+                                send(&self.event_tx, "connection attempt", EmulationEvent::ConnectionAttempt { fingerprint });
                             }
                     }
                     None => break
                 }}
-                event = self.emulation_proxy.event() => {
-                    self.event_tx.send(event).expect("channel closed");
-                }
-                request = self.request_rx.recv() => match request.expect("channel closed") {
+                event = self.emulation_proxy.event() => match event {
+                    Some(event) => send(&self.event_tx, "emulation event", event),
+                    None => break,
+                },
+                request = self.request_rx.recv() => match request {
+                    None => break,
                     // reenable emulation
-                    EmulationRequest::Reenable => self.emulation_proxy.reenable(),
+                    Some(EmulationRequest::Reenable) => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
-                    EmulationRequest::ChangePort(port) => {
+                    Some(EmulationRequest::Release(addr)) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    Some(EmulationRequest::ChangePort(port)) => {
                         self.listener.request_port_change(port);
-                        let result = self.listener.port_changed().await;
-                        self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
+                        match self.listener.port_changed().await {
+                            Some(result) => send(&self.event_tx, "port change result", EmulationEvent::PortChanged(result)),
+                            None => break,
+                        }
                     }
-                    EmulationRequest::SetClipboard { text, broadcast } => {
+                    Some(EmulationRequest::SetClipboard { text, broadcast }) => {
                         self.clipboard_text = text;
                         if broadcast {
                             if let Some(text) = self.clipboard_text.as_deref() {
@@ -245,20 +249,20 @@ impl ListenTask {
                             }
                         }
                     }
-                    EmulationRequest::Terminate => break,
                 },
                 _ = interval.tick() => {
                     last_response.retain(|&addr,instant| {
                         if instant.elapsed() > PEER_TIMEOUT {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
-                            self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
+                            send(&self.event_tx, "peer disconnected", EmulationEvent::Disconnected { addr });
                             false
                         } else {
                             true
                         }
                     });
                 }
+                _ = self.cancellation_token.cancelled() => break,
             }
         }
         self.listener.terminate().await;
@@ -270,16 +274,14 @@ impl ListenTask {
 /// discarding events when it is disabled
 pub(crate) struct EmulationProxy {
     emulation_active: Rc<Cell<bool>>,
-    exit_requested: Rc<Cell<bool>>,
     request_tx: Sender<ProxyRequest>,
     event_rx: Receiver<EmulationEvent>,
-    task: JoinHandle<()>,
+    task: TaskHandle,
 }
 
 enum ProxyRequest {
     Input(Event, SocketAddr, Timestamp),
     Remove(SocketAddr),
-    Terminate,
     Reenable,
 }
 
@@ -292,76 +294,77 @@ impl ProxyRequest {
 }
 
 impl EmulationProxy {
-    fn new(backend: Option<input_emulation::Backend>) -> Self {
+    fn new(
+        backend: Option<input_emulation::Backend>,
+        cancellation_token: CancellationToken,
+    ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_active = Rc::new(Cell::new(false));
-        let exit_requested = Rc::new(Cell::new(false));
         let emulation_task = EmulationTask {
             backend,
-            exit_requested: exit_requested.clone(),
+            cancellation_token: cancellation_token.clone(),
             request_rx,
             event_tx,
             handles: Default::default(),
             next_id: 0,
         };
-        let task = spawn_local(emulation_task.run());
+        let task = TaskHandle::new(cancellation_token, spawn_local(emulation_task.run()));
         Self {
             emulation_active,
-            exit_requested,
             request_tx,
             task,
             event_rx,
         }
     }
 
-    async fn event(&mut self) -> EmulationEvent {
-        let event = self.event_rx.recv().await.expect("channel closed");
+    /// The next event from the emulation backend, or `None` once its task has
+    /// stopped.
+    async fn event(&mut self) -> Option<EmulationEvent> {
+        let event = self.event_rx.recv().await?;
         if let EmulationEvent::EmulationEnabled = event {
             self.emulation_active.replace(true);
         }
         if let EmulationEvent::EmulationDisabled = event {
             self.emulation_active.replace(false);
         }
-        event
+        Some(event)
     }
 
     fn consume(&self, event: Event, addr: SocketAddr, received_at: Timestamp) {
         // ignore events if emulation is currently disabled
         if self.emulation_active.get() {
             observability::injection_queue_push();
-            self.request_tx
-                .send(ProxyRequest::Input(event, addr, received_at))
-                .expect("channel closed");
+            send(
+                &self.request_tx,
+                "input event",
+                ProxyRequest::Input(event, addr, received_at),
+            );
         } else {
             observability::record_emulation_inactive_drop(&event);
         }
     }
 
     fn remove(&self, addr: SocketAddr) {
-        self.request_tx
-            .send(ProxyRequest::Remove(addr))
-            .expect("channel closed");
+        send(&self.request_tx, "peer removal", ProxyRequest::Remove(addr));
     }
 
     fn reenable(&self) {
-        self.request_tx
-            .send(ProxyRequest::Reenable)
-            .expect("channel closed");
+        send(
+            &self.request_tx,
+            "emulation reenable",
+            ProxyRequest::Reenable,
+        );
     }
 
     async fn terminate(&mut self) {
-        self.exit_requested.replace(true);
-        self.request_tx
-            .send(ProxyRequest::Terminate)
-            .expect("channel closed");
-        let _ = (&mut self.task).await;
+        self.task.terminate("emulation backend").await;
     }
 }
 
 struct EmulationTask {
     backend: Option<input_emulation::Backend>,
-    exit_requested: Rc<Cell<bool>>,
+    cancellation_token: CancellationToken,
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
@@ -374,16 +377,21 @@ impl EmulationTask {
             if let Err(e) = self.do_emulation().await {
                 log::warn!("input emulation exited: {e}");
             }
-            if self.exit_requested.get() {
+            if self.cancellation_token.is_cancelled() {
                 break;
             }
             // wait for reenable request
             loop {
-                let request = self.request_rx.recv().await.expect("channel closed");
+                let request = select! {
+                    request = self.request_rx.recv() => match request {
+                        Some(request) => request,
+                        None => return,
+                    },
+                    _ = self.cancellation_token.cancelled() => return,
+                };
                 request.record_dequeued();
                 match request {
                     ProxyRequest::Reenable => break,
-                    ProxyRequest::Terminate => return,
                     ProxyRequest::Input(event, ..) => {
                         observability::record_emulation_inactive_drop(&event);
                     }
@@ -395,10 +403,10 @@ impl EmulationTask {
 
     async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
-        let mut emulation = tokio::select! {
+        let mut emulation = select! {
             r = InputEmulation::new(self.backend) => r?,
-            // allow termination event while requesting input emulation
-            _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+            // allow termination while requesting input emulation
+            _ = self.cancellation_token.cancelled() => return Ok(()),
         };
 
         // used to send enabled and disabled events
@@ -425,9 +433,9 @@ impl EmulationTask {
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
         for handle in self.handles.values() {
-            tokio::select! {
+            select! {
                 _ = emulation.create(*handle) => {},
-                _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+                _ = self.cancellation_token.cancelled() => return Ok(()),
             }
         }
         Ok(())
@@ -438,9 +446,12 @@ impl EmulationTask {
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
         loop {
-            tokio::select! {
+            select! {
+                _ = self.cancellation_token.cancelled() => break Ok(()),
                 e = self.request_rx.recv() => {
-                    let request = e.expect("channel closed");
+                    let Some(request) = e else {
+                        break Ok(());
+                    };
                     request.record_dequeued();
                     match request {
                     ProxyRequest::Input(event, addr, received_at) => {
@@ -463,25 +474,9 @@ impl EmulationTask {
                             emulation.destroy(handle).await;
                         }
                     }
-                    ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
                 }},
             }
-        }
-    }
-}
-
-async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
-    loop {
-        let request = rx.recv().await.expect("channel closed");
-        request.record_dequeued();
-        match request {
-            ProxyRequest::Terminate => return,
-            ProxyRequest::Input(event, ..) => {
-                observability::record_emulation_inactive_drop(&event);
-            }
-            ProxyRequest::Remove(_) => continue,
-            ProxyRequest::Reenable => continue,
         }
     }
 }

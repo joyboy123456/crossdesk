@@ -3,13 +3,13 @@ use crate::{
     config::local_commit,
     observability::{self, Timestamp},
     peer::PeerCapabilities,
+    task::{Receiver, Sender, channel, send},
 };
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{
     CAPABILITY_CLIPBOARD_TEXT, MAX_EVENT_SIZE, MAX_WIRE_SIZE, ProtoEvent, ProtocolError, WireEvent,
     decode_wire_event, encode_clipboard_text,
 };
-use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -137,12 +137,10 @@ async fn connect_any(
     loop {
         match joinset.join_next().await {
             None => return Err(ConnectionError::NotConnected),
-            Some(r) => match r.expect("join error") {
-                Ok(conn) => return Ok(conn),
-                Err((a, e)) => {
-                    log::warn!("failed to connect to {a}: `{e}`")
-                }
-            },
+            // One attempt failing says nothing about the others; keep going.
+            Some(Err(e)) => log::warn!("connection attempt did not finish: {e}"),
+            Some(Ok(Ok(conn))) => return Ok(conn),
+            Some(Ok(Err((a, e)))) => log::warn!("failed to connect to {a}: `{e}`"),
         };
     }
 }
@@ -202,8 +200,11 @@ impl Connection {
         }
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, WireEvent) {
-        self.recv_rx.recv().await.expect("channel closed")
+    /// The next event received from a peer.
+    ///
+    /// Never resolves to `None`: this [`Connection`] owns the sending half.
+    pub(crate) async fn recv(&mut self) -> Option<(ClientHandle, WireEvent)> {
+        self.recv_rx.recv().await
     }
 
     pub(crate) async fn send(
@@ -425,16 +426,16 @@ async fn receive_loop(
                         context.client_manager.set_peer_commit(handle, Some(commit));
                         context.peer_capabilities.set(addr, capabilities);
                     }
-                    event => context
-                        .recv_tx
-                        .send((handle, WireEvent::Protocol(event)))
-                        .expect("channel closed"),
+                    event => send(
+                        &context.recv_tx,
+                        "protocol event",
+                        (handle, WireEvent::Protocol(event)),
+                    ),
                 }
             }
-            Ok(event @ WireEvent::ClipboardText(_)) => context
-                .recv_tx
-                .send((handle, event))
-                .expect("channel closed"),
+            Ok(event @ WireEvent::ClipboardText(_)) => {
+                send(&context.recv_tx, "clipboard event", (handle, event))
+            }
             // Skip undecodable datagrams without dropping the
             // connection. Each DTLS recv is one framed message, so
             // skipping is safe and keeps us forward-compatible with

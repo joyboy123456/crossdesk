@@ -569,7 +569,8 @@ impl Config {
         log::info!("writing config to {:?}", self.config_path);
         /* the new config */
         let new_config = self.config_toml.clone().unwrap_or_default();
-        let new_config = toml_edit::ser::to_string_pretty(&new_config).expect("config");
+        let new_config = toml_edit::ser::to_string_pretty(&new_config)
+            .map_err(|e| io::Error::other(format!("could not serialize the configuration: {e}")))?;
 
         /*
          * TODO merge with current config file to preserve comments

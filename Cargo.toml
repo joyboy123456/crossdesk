@@ -107,7 +107,6 @@ clap = { workspace = true }
 slab = "0.4.9"
 thiserror = { workspace = true }
 tokio-util = { workspace = true }
-local-channel = "0.1.5"
 webrtc-dtls = { version = "0.12.0", features = ["pem"] }
 webrtc-util = "0.11.0"
 rustls = { version = "0.23.12", default-features = false, features = [
@@ -117,6 +116,11 @@ rustls = { version = "0.23.12", default-features = false, features = [
 rcgen = "0.13.1"
 sha2 = "0.10.8"
 notify = "8.2.0"
+
+[dev-dependencies]
+# time control, so the task-termination backstop can be tested without
+# actually waiting for it
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
