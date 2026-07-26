@@ -20,10 +20,11 @@ use windows::core::{PCWSTR, w};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
     HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE,
-    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
+    RegisterClassW, SetCursorPos, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    WNDPROC,
 };
 
 use input_event::{
@@ -52,8 +53,12 @@ impl EventThread {
         }
     }
 
-    pub(crate) fn release_capture(&self) {
-        self.signal(RequestType::Release);
+    pub(crate) fn release_capture(&self, edge_ratio: Option<f64>) {
+        let id = self.thread_id;
+        let lparam = LPARAM(encode_release_ratio(edge_ratio));
+        unsafe {
+            PostThreadMessageW(id, WM_USER, WPARAM(RequestType::Release as usize), lparam).unwrap()
+        };
     }
 
     pub(crate) fn create(&self, pos: Position) {
@@ -93,6 +98,25 @@ enum RequestType {
     ClientUpdate = 0,
     Release = 1,
     Exit = 2,
+}
+
+/// fixed-point encoding of the optional release edge ratio, so it fits the
+/// otherwise unused LPARAM of the Release thread message
+const RELEASE_RATIO_SCALE: f64 = 1_000_000.0;
+
+fn encode_release_ratio(ratio: Option<f64>) -> isize {
+    match ratio {
+        Some(r) if r.is_finite() => (r.clamp(0.0, 1.0) * RELEASE_RATIO_SCALE) as isize,
+        _ => -1,
+    }
+}
+
+fn decode_release_ratio(lparam: isize) -> Option<f64> {
+    if lparam < 0 {
+        None
+    } else {
+        Some((lparam as f64 / RELEASE_RATIO_SCALE).clamp(0.0, 1.0))
+    }
 }
 
 enum ClientUpdate {
@@ -265,7 +289,23 @@ fn start_routine(
             match msg.wParam.0 {
                 x if x == RequestType::Exit as usize => break,
                 x if x == RequestType::Release as usize => {
-                    ACTIVE_CLIENT.take();
+                    let released = ACTIVE_CLIENT.take();
+                    /* place the local cursor where the remote cursor crossed
+                     * back over the barrier. This must happen *after* the
+                     * client is deactivated: while active, the low-level hook
+                     * swallows the move SetCursorPos injects and the cursor
+                     * would not actually move. */
+                    if let (Some(pos), Some(ratio)) = (released, decode_release_ratio(msg.lParam.0))
+                    {
+                        let target = DISPLAYS.with_borrow_mut(|(displays, generation)| {
+                            update_display_regions(displays, generation);
+                            display_util::point_on_edge(displays, pos, ratio)
+                        });
+                        PREV_POS.replace(Some(target));
+                        if let Err(e) = unsafe { SetCursorPos(target.0, target.1) } {
+                            log::warn!("SetCursorPos({}, {}) failed: {e}", target.0, target.1);
+                        }
+                    }
                 }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
@@ -327,15 +367,22 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 
     /* update active client and entry point */
     ACTIVE_CLIENT.replace(Some(pos));
-    let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
-        display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
+    let (entry_point, entry_ratio) = DISPLAYS.with_borrow(|(displays, _)| {
+        let entry_point = display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos);
+        let ratio = display_util::edge_ratio(displays, pos, entry_point);
+        (entry_point, ratio)
     });
     ENTRY_POINT.replace(entry_point);
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin);
+    blocking_send_event(
+        active,
+        CaptureEvent::Begin {
+            ratio: Some(entry_ratio),
+        },
+    );
 
     ret
 }
@@ -581,5 +628,33 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             log::warn!("unknown mouse event: {w:?}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_release_ratio, encode_release_ratio};
+
+    #[test]
+    fn release_ratio_round_trips_through_lparam() {
+        for ratio in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let decoded = decode_release_ratio(encode_release_ratio(Some(ratio)));
+            let recovered = decoded.expect("ratio survives encoding");
+            assert!((recovered - ratio).abs() < 1e-6, "{ratio} -> {recovered}");
+        }
+        assert_eq!(decode_release_ratio(encode_release_ratio(None)), None);
+    }
+
+    #[test]
+    fn abnormal_ratios_are_sanitized() {
+        assert_eq!(encode_release_ratio(Some(f64::NAN)), -1);
+        assert_eq!(
+            decode_release_ratio(encode_release_ratio(Some(-3.0))),
+            Some(0.0)
+        );
+        assert_eq!(
+            decode_release_ratio(encode_release_ratio(Some(42.0))),
+            Some(1.0)
+        );
     }
 }

@@ -58,6 +58,35 @@ fn cg_line_scroll_to_wire(delta: i32, natural_scrolling: bool) -> i32 {
     if natural_scrolling { delta } else { -delta }
 }
 
+/// normalized position of `location` along the barrier edge `pos`, relative
+/// to the desktop bounding box (top/left = 0.0)
+fn edge_ratio(bounds: &Bounds, pos: Position, location: CGPoint) -> f64 {
+    let (coord, min, max) = match pos {
+        Position::Left | Position::Right => (location.y, bounds.ymin, bounds.ymax),
+        Position::Top | Position::Bottom => (location.x, bounds.xmin, bounds.xmax),
+    };
+    if max <= min {
+        return 0.0;
+    }
+    ((coord - min) / (max - min)).clamp(0.0, 1.0)
+}
+
+/// the point at `ratio` along the barrier edge `pos` of the desktop bounding
+/// box, moved 1pt inward from the edge so it cannot immediately re-cross the
+/// barrier
+fn point_on_edge(bounds: &Bounds, pos: Position, ratio: f64) -> CGPoint {
+    let ratio = ratio.clamp(0.0, 1.0);
+    let edge_offset = 1.0;
+    let along = |min: f64, max: f64| min + (max - min) * ratio;
+    let (x, y) = match pos {
+        Position::Left => (bounds.xmin + edge_offset, along(bounds.ymin, bounds.ymax)),
+        Position::Right => (bounds.xmax - edge_offset, along(bounds.ymin, bounds.ymax)),
+        Position::Top => (along(bounds.xmin, bounds.xmax), bounds.ymin + edge_offset),
+        Position::Bottom => (along(bounds.xmin, bounds.xmax), bounds.ymax - edge_offset),
+    };
+    CGPoint { x, y }
+}
+
 /// Reads the system natural-scrolling preference
 /// (`com.apple.swipescrolldirection` in the Apple Global Domain).
 /// The key is absent on a freshly set-up account; natural scrolling
@@ -118,7 +147,7 @@ struct InputCaptureState {
 
 #[derive(Debug)]
 enum ProducerEvent {
-    Release,
+    Release(Option<f64>),
     Create(Position),
     Destroy(Position),
     Grab(Position),
@@ -174,9 +203,11 @@ impl InputCaptureState {
         Ok(())
     }
 
-    /// start the input capture by
-    fn start_capture(&mut self, event: &CGEvent, position: Position) -> Result<(), CaptureError> {
+    /// start the input capture; returns where along the crossed edge the
+    /// cursor left the screen, normalized to [0, 1]
+    fn start_capture(&mut self, event: &CGEvent, position: Position) -> Result<f64, CaptureError> {
         let mut location = event.location();
+        let ratio = edge_ratio(&self.bounds, position, location);
         let edge_offset = 1.0;
         // move cursor location to display bounds
         match position {
@@ -186,7 +217,8 @@ impl InputCaptureState {
             Position::Bottom => location.y = self.bounds.ymax - edge_offset,
         };
         self.enter_position = Some(location);
-        self.reset_cursor()
+        self.reset_cursor()?;
+        Ok(ratio)
     }
 
     /// resets the cursor to the position, where the capture started
@@ -210,8 +242,16 @@ impl InputCaptureState {
     ) -> Result<(), CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
-            ProducerEvent::Release => {
-                if self.current_pos.is_some() {
+            ProducerEvent::Release(edge_ratio) => {
+                if let Some(pos) = self.current_pos {
+                    // place the cursor where the remote cursor crossed back
+                    // over the barrier (the warp suppression interval was
+                    // already lowered in configure_cf_settings)
+                    if let Some(ratio) = edge_ratio {
+                        let target = point_on_edge(&self.bounds, pos, ratio);
+                        CGDisplay::warp_mouse_cursor_position(target)
+                            .map_err(CaptureError::WarpCursor)?;
+                    }
                     self.show_cursor()?;
                     self.current_pos = None;
                 }
@@ -587,10 +627,14 @@ fn create_event_tap<'a>(
             // Did we cross a barrier?
             if let Some(new_pos) = state.crossed(cg_ev) {
                 capture_position = Some(new_pos);
-                state
-                    .start_capture(cg_ev, new_pos)
-                    .unwrap_or_else(|e| log::warn!("{e}"));
-                res_events.push(CaptureEvent::Begin);
+                let ratio = match state.start_capture(cg_ev, new_pos) {
+                    Ok(ratio) => Some(ratio),
+                    Err(e) => {
+                        log::warn!("{e}");
+                        None
+                    }
+                };
+                res_events.push(CaptureEvent::Begin { ratio });
                 notify_tx
                     .blocking_send(ProducerEvent::Grab(new_pos))
                     .expect("Failed to send notification");
@@ -851,11 +895,11 @@ impl Capture for MacOSInputCapture {
         Ok(())
     }
 
-    async fn release(&mut self) -> Result<(), CaptureError> {
+    async fn release(&mut self, edge_ratio: Option<f64>) -> Result<(), CaptureError> {
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
             log::debug!("notifying Release");
-            let _ = notify_tx.send(ProducerEvent::Release).await;
+            let _ = notify_tx.send(ProducerEvent::Release(edge_ratio)).await;
         });
         Ok(())
     }
@@ -972,7 +1016,56 @@ bitflags! {
 
 #[cfg(test)]
 mod tests {
-    use super::cg_line_scroll_to_wire;
+    use super::{Bounds, Position, cg_line_scroll_to_wire, edge_ratio, point_on_edge};
+
+    const BOUNDS: Bounds = Bounds {
+        xmin: 0.0,
+        xmax: 1512.0,
+        ymin: 0.0,
+        ymax: 982.0,
+    };
+
+    #[test]
+    fn edge_ratio_spans_the_bounding_box() {
+        let top = super::CGPoint { x: 0.0, y: 0.0 };
+        let mid = super::CGPoint { x: 756.0, y: 491.0 };
+        let bottom = super::CGPoint {
+            x: 1512.0,
+            y: 982.0,
+        };
+        assert_eq!(edge_ratio(&BOUNDS, Position::Left, top), 0.0);
+        assert_eq!(edge_ratio(&BOUNDS, Position::Right, mid), 0.5);
+        assert_eq!(edge_ratio(&BOUNDS, Position::Right, bottom), 1.0);
+        assert_eq!(edge_ratio(&BOUNDS, Position::Bottom, mid), 0.5);
+    }
+
+    #[test]
+    fn point_on_edge_round_trips_and_stays_inside() {
+        for pos in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            for ratio in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let point = point_on_edge(&BOUNDS, pos, ratio);
+                assert!(point.x > BOUNDS.xmin - 0.5 && point.x < BOUNDS.xmax + 0.5);
+                assert!(point.y > BOUNDS.ymin - 0.5 && point.y < BOUNDS.ymax + 0.5);
+                let recovered = edge_ratio(&BOUNDS, pos, point);
+                assert!(
+                    (recovered - ratio).abs() < 0.01,
+                    "{pos:?}: {ratio} -> {recovered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_range_ratio_is_clamped() {
+        let low = point_on_edge(&BOUNDS, Position::Right, -1.0);
+        let zero = point_on_edge(&BOUNDS, Position::Right, 0.0);
+        assert_eq!((low.x, low.y), (zero.x, zero.y));
+    }
 
     #[test]
     fn passes_line_scroll_through_when_natural_scrolling_on() {

@@ -628,7 +628,9 @@ impl Capture for LayerShellInputCapture {
         Ok(inner.flush_events()?)
     }
 
-    async fn release(&mut self) -> Result<(), CaptureError> {
+    async fn release(&mut self, _edge_ratio: Option<f64>) -> Result<(), CaptureError> {
+        // the ratio hint cannot be honored: Wayland compositors do not allow
+        // clients to warp the pointer to an arbitrary position
         log::debug!("releasing pointer");
         let inner = self.0.get_mut();
         inner.state.ungrab();
@@ -753,7 +755,8 @@ impl Dispatch<WlPointer, ()> for State {
                     .find(|w| w.surface == surface)
                     .map(|w| w.pos)
                     .unwrap();
-                app.pending_events.push_back((pos, CaptureEvent::Begin));
+                app.pending_events
+                    .push_back((pos, CaptureEvent::Begin { ratio: None }));
             }
             wl_pointer::Event::Leave { .. } => {
                 /* There are rare cases, where when a window is opened in

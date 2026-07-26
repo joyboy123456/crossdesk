@@ -40,8 +40,10 @@ pub type CaptureHandle = u64;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
-    /// capture on this capture handle is now active
-    Begin,
+    /// capture on this capture handle is now active; `ratio` is the position
+    /// of the crossing point along the barrier edge, normalized against this
+    /// host's desktop bounding box (top/left = 0.0), if the backend knows it
+    Begin { ratio: Option<f64> },
     /// input event coming from capture handle
     Input(Event),
 }
@@ -49,7 +51,7 @@ pub enum CaptureEvent {
 impl Display for CaptureEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CaptureEvent::Begin => write!(f, "begin capture"),
+            CaptureEvent::Begin { .. } => write!(f, "begin capture"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
         }
     }
@@ -168,10 +170,11 @@ impl InputCapture {
         Ok(())
     }
 
-    /// release mouse
-    pub async fn release(&mut self) -> Result<(), CaptureError> {
+    /// release mouse; `edge_ratio` is a hint for where along the released
+    /// barrier edge the cursor should reappear (normalized, top/left = 0.0)
+    pub async fn release(&mut self, edge_ratio: Option<f64>) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
-        self.capture.release().await
+        self.capture.release(edge_ratio).await
     }
 
     /// Drain and return every key the capture has forwarded as
@@ -287,8 +290,9 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     /// destroy the client with the given id, if it exists
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError>;
 
-    /// release mouse
-    async fn release(&mut self) -> Result<(), CaptureError>;
+    /// release mouse; `edge_ratio` hints where along the released barrier
+    /// edge the local cursor should reappear (normalized, top/left = 0.0)
+    async fn release(&mut self, edge_ratio: Option<f64>) -> Result<(), CaptureError>;
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;

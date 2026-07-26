@@ -20,7 +20,7 @@ pub(crate) enum CaptureEventKind {
 
 pub(crate) fn event_kind(event: &CaptureEvent) -> CaptureEventKind {
     match event {
-        CaptureEvent::Begin => CaptureEventKind::Begin,
+        CaptureEvent::Begin { .. } => CaptureEventKind::Begin,
         CaptureEvent::Input(event) => CaptureEventKind::Input(EventKind::of(event)),
     }
 }

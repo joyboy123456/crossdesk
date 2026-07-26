@@ -425,7 +425,7 @@ async fn do_capture_session(
                     current_pos.replace(Some(pos));
 
                     // client entered => send event
-                    event_tx.send((pos, CaptureEvent::Begin)).await.expect("no channel");
+                    event_tx.send((pos, CaptureEvent::Begin { ratio: None })).await.expect("no channel");
 
                     tokio::select! {
                         _ = notify_release.notified() => { /* capture release */
@@ -594,7 +594,9 @@ impl PlatformInputCapture for LibeiInputCapture {
         Ok(())
     }
 
-    async fn release(&mut self) -> Result<(), CaptureError> {
+    async fn release(&mut self, _edge_ratio: Option<f64>) -> Result<(), CaptureError> {
+        // the ratio hint is currently unused: release_capture() places the
+        // cursor back at the barrier entry point via ReleaseOptions
         self.notify_release.notify_waiters();
         Ok(())
     }

@@ -31,8 +31,8 @@ impl Capture for WindowsInputCapture {
         Ok(())
     }
 
-    async fn release(&mut self) -> Result<(), CaptureError> {
-        self.event_thread.release_capture();
+    async fn release(&mut self, edge_ratio: Option<f64>) -> Result<(), CaptureError> {
+        self.event_thread.release_capture(edge_ratio);
         Ok(())
     }
 

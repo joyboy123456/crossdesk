@@ -375,7 +375,7 @@ impl CaptureTask {
                         // client disconnected
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
-                            self.release_capture(capture).await?;
+                            self.release_capture(capture, None).await?;
                         },
                         _ => {}
                     }
@@ -383,7 +383,7 @@ impl CaptureTask {
                 e = self.request_rx.recv() => match e {
                     None => return Ok(()),
                     Some(CaptureRequest::Reenable) => { /* already active */ },
-                    Some(CaptureRequest::Release) => self.release_capture(capture).await?,
+                    Some(CaptureRequest::Release) => self.release_capture(capture, None).await?,
                     Some(CaptureRequest::Create(h, p, t)) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
@@ -422,7 +422,7 @@ impl CaptureTask {
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
-            return self.release_capture(capture).await;
+            return self.release_capture(capture, None).await;
         }
 
         // The backend can still deliver events for a handle we just destroyed;
@@ -432,7 +432,7 @@ impl CaptureTask {
             return Ok(());
         };
 
-        if event == CaptureEvent::Begin {
+        if matches!(event, CaptureEvent::Begin { .. }) {
             send(
                 &self.event_tx,
                 "capture begin",
@@ -446,14 +446,14 @@ impl CaptureTask {
             // we release the capture
             if !self.is_default_capture_at(pos) {
                 log::info!("releasing capture: no active client at this position");
-                capture.release().await?;
+                capture.release(None).await?;
             }
             // we dont care about events from incoming handles except for releasing the capture
             return Ok(());
         }
 
         // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
+        if matches!(event, CaptureEvent::Begin { .. }) && Some(handle) != self.active_client {
             self.active_client.replace(handle);
             self.switch_started_at = Some(Timestamp::now());
             self.set_state(State::WaitingForAck, "edge_entered");
@@ -467,7 +467,7 @@ impl CaptureTask {
         let opposite_pos = capture_to_proto(pos.opposite());
 
         let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+            CaptureEvent::Begin { .. } => ProtoEvent::Enter(opposite_pos),
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
                 State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
@@ -488,13 +488,17 @@ impl CaptureTask {
                     log::warn!("releasing capture: {e}")
                 );
                 self.switch_started_at = None;
-                capture.release().await?;
+                capture.release(None).await?;
             }
         }
         Ok(())
     }
 
-    async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+    async fn release_capture(
+        &mut self,
+        capture: &mut InputCapture,
+        edge_ratio: Option<f64>,
+    ) -> Result<(), CaptureError> {
         self.switch_started_at = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
@@ -538,7 +542,7 @@ impl CaptureTask {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }
-        capture.release().await
+        capture.release(edge_ratio).await
     }
 
     async fn send_clipboard_to(&self, handle: CaptureHandle) {

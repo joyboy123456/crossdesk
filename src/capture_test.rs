@@ -41,7 +41,7 @@ async fn do_capture(input_capture: &mut InputCapture) -> Result<(), CaptureError
         };
         log::info!("position: {client} ({pos}), event: {event}");
         if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key: 1, .. })) = event {
-            input_capture.release().await?;
+            input_capture.release(None).await?;
             break Ok(());
         }
     }
