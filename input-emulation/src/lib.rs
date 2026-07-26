@@ -73,6 +73,18 @@ pub enum Backend {
     Dummy,
 }
 
+impl Backend {
+    /// Whether this backend can actually move the local cursor.
+    ///
+    /// [`Backend::Dummy`] discards everything it is given. Treating it as a
+    /// working emulation lets a peer take control of a machine it cannot
+    /// actually move, which strands the peer's own cursor: it never reaches
+    /// the barrier that would hand control back.
+    pub fn can_emulate(&self) -> bool {
+        *self != Backend::Dummy
+    }
+}
+
 impl Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -134,7 +146,7 @@ impl InputEmulation {
 
     /// whether this emulation can actually move the local cursor
     pub fn can_emulate(&self) -> bool {
-        self.backend != Backend::Dummy
+        self.backend.can_emulate()
     }
 
     pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
@@ -285,4 +297,20 @@ trait Emulation: Send {
     /// (normalized, top/left = 0.0) along the edge `pos`. Backends that
     /// cannot position the cursor keep the default no-op.
     async fn enter(&mut self, _handle: EmulationHandle, _pos: Position, _ratio: f64) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Backend;
+
+    /// The service decides whether to let a peer take control from this, so a
+    /// backend that silently drops events must never claim it can emulate.
+    #[test]
+    fn dummy_backend_cannot_emulate() {
+        assert!(!Backend::Dummy.can_emulate());
+        #[cfg(windows)]
+        assert!(Backend::Windows.can_emulate());
+        #[cfg(target_os = "macos")]
+        assert!(Backend::MacOs.can_emulate());
+    }
 }

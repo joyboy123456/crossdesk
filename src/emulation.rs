@@ -588,3 +588,36 @@ impl EmulationTask {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dummy backend accepts every event and throws it away. If the service
+    /// announced that as enabled, a peer would be allowed to enter this
+    /// device and its own cursor would be captured against a black hole: the
+    /// local cursor never moves, so it never reaches the barrier that hands
+    /// control back, and the peer's mouse and keyboard stay frozen.
+    #[tokio::test]
+    async fn a_dummy_backend_is_never_announced_as_enabled() {
+        let (event_tx, mut event_rx) = channel();
+        let (request_tx, request_rx) = channel();
+        // closing the request channel ends the session loop immediately
+        drop(request_tx);
+
+        let mut task = EmulationTask {
+            backend: Some(input_emulation::Backend::Dummy),
+            cancellation_token: CancellationToken::new(),
+            request_rx,
+            event_tx,
+            handles: Default::default(),
+            next_id: 0,
+        };
+        task.do_emulation().await.expect("dummy emulation session");
+
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the dummy backend must not report emulation as enabled"
+        );
+    }
+}
