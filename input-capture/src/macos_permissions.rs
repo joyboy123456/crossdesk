@@ -15,12 +15,20 @@ use core_foundation_sys::dictionary::CFDictionaryRef;
 use core_foundation_sys::number::kCFBooleanTrue;
 use core_foundation_sys::string::CFStringRef;
 
-static PROMPTED: AtomicBool = AtomicBool::new(false);
+static ACCESSIBILITY_PROMPTED: AtomicBool = AtomicBool::new(false);
+static EVENT_ACCESS_PROMPTED: AtomicBool = AtomicBool::new(false);
 
-/// Whether a user-visible permission prompt may be shown now. At most one
-/// per process, so repeatedly re-enabling emulation does not spam dialogs.
-pub(crate) fn prompt_allowed() -> bool {
-    !PROMPTED.swap(true, Ordering::SeqCst)
+/// Whether the accessibility prompt may be shown now. Tracked separately
+/// from the event-access prompt so both are asked for on the first run, but
+/// at most once each per process - repeatedly re-enabling emulation must not
+/// spam dialogs.
+pub(crate) fn accessibility_prompt_allowed() -> bool {
+    !ACCESSIBILITY_PROMPTED.swap(true, Ordering::SeqCst)
+}
+
+/// Whether the input monitoring / post event prompt may be shown now.
+pub(crate) fn event_access_prompt_allowed() -> bool {
+    !EVENT_ACCESS_PROMPTED.swap(true, Ordering::SeqCst)
 }
 
 /// Ask for accessibility access, showing the system dialog. Returns whether

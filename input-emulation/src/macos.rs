@@ -220,7 +220,7 @@ fn request_accessibility_permission() -> bool {
     if unsafe { AXIsProcessTrusted() } {
         return true;
     }
-    if crate::macos_permissions::prompt_allowed() {
+    if crate::macos_permissions::accessibility_prompt_allowed() {
         crate::macos_permissions::prompt_for_accessibility()
     } else {
         false
@@ -231,7 +231,7 @@ fn request_input_control_permission() -> bool {
     if unsafe { CGPreflightPostEventAccess() } {
         return true;
     }
-    if crate::macos_permissions::prompt_allowed() {
+    if crate::macos_permissions::event_access_prompt_allowed() {
         unsafe { CGRequestPostEventAccess() }
     } else {
         false
