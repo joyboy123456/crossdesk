@@ -15,6 +15,10 @@ pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_
 /// Capability bit indicating support for UTF-8 clipboard text packets.
 pub const CAPABILITY_CLIPBOARD_TEXT: u32 = 1 << 0;
 
+/// Capability bit indicating support for the position-carrying
+/// [`ProtoEvent::EnterAt`] and [`ProtoEvent::LeaveAt`] events.
+pub const CAPABILITY_ENTER_POSITION: u32 = 1 << 1;
+
 /// Maximum UTF-8 clipboard payload accepted from a peer.
 pub const MAX_CLIPBOARD_TEXT_SIZE: usize = 16 * 1024;
 
@@ -97,6 +101,16 @@ pub enum ProtoEvent {
         /// Optional feature bits. Legacy Hello packets decode this as zero.
         capabilities: u32,
     },
+    /// like [`ProtoEvent::Enter`], but carrying where the cursor crossed the
+    /// barrier: `ratio` in [0.0, 1.0] is the position along the entered edge,
+    /// normalized against the sender's desktop bounding box (top/left = 0.0).
+    /// Only sent to peers advertising [`CAPABILITY_ENTER_POSITION`].
+    EnterAt { pos: Position, ratio: f64 },
+    /// like [`ProtoEvent::Leave`], but carrying where the cursor crossed the
+    /// barrier; `ratio` as in [`ProtoEvent::EnterAt`], normalized against the
+    /// sender's desktop bounding box.
+    /// Only sent to peers advertising [`CAPABILITY_ENTER_POSITION`].
+    LeaveAt { serial: u32, ratio: f64 },
 }
 
 impl Display for ProtoEvent {
@@ -118,6 +132,8 @@ impl Display for ProtoEvent {
                 let s = std::str::from_utf8(commit).unwrap_or("????????");
                 write!(f, "Hello({s})")
             }
+            ProtoEvent::EnterAt { pos, ratio } => write!(f, "EnterAt({pos}, {ratio})"),
+            ProtoEvent::LeaveAt { serial, ratio } => write!(f, "LeaveAt({serial}, {ratio})"),
         }
     }
 }
@@ -137,6 +153,8 @@ pub enum EventType {
     Leave,
     Ack,
     Hello,
+    EnterAt,
+    LeaveAt,
 }
 
 impl ProtoEvent {
@@ -160,6 +178,8 @@ impl ProtoEvent {
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
+            ProtoEvent::EnterAt { .. } => EventType::EnterAt,
+            ProtoEvent::LeaveAt { .. } => EventType::LeaveAt,
         }
     }
 }
@@ -225,6 +245,14 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                     capabilities,
                 })
             }
+            EventType::EnterAt => Ok(Self::EnterAt {
+                pos: decode_u8(&mut buf)?.try_into()?,
+                ratio: decode_f64(&mut buf)?,
+            }),
+            EventType::LeaveAt => Ok(Self::LeaveAt {
+                serial: decode_u32(&mut buf)?,
+                ratio: decode_f64(&mut buf)?,
+            }),
         }
     }
 }
@@ -297,6 +325,14 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                         encode_u8(buf, len, *b);
                     }
                     encode_u32(buf, len, capabilities);
+                }
+                ProtoEvent::EnterAt { pos, ratio } => {
+                    encode_u8(buf, len, pos as u8);
+                    encode_f64(buf, len, ratio);
+                }
+                ProtoEvent::LeaveAt { serial, ratio } => {
+                    encode_u32(buf, len, serial);
+                    encode_f64(buf, len, ratio);
                 }
             }
         }
@@ -415,9 +451,9 @@ encode_impl!(f64);
 #[cfg(test)]
 mod tests {
     use super::{
-        CAPABILITY_CLIPBOARD_TEXT, EventType, MAX_CLIPBOARD_TEXT_SIZE, MAX_EVENT_SIZE,
-        MAX_WIRE_SIZE, Position, ProtoEvent, ProtocolError, WireEvent, decode_wire_event,
-        encode_clipboard_text,
+        CAPABILITY_CLIPBOARD_TEXT, CAPABILITY_ENTER_POSITION, EventType, MAX_CLIPBOARD_TEXT_SIZE,
+        MAX_EVENT_SIZE, MAX_WIRE_SIZE, Position, ProtoEvent, ProtocolError, WireEvent,
+        decode_wire_event, encode_clipboard_text,
     };
     use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
 
@@ -562,6 +598,46 @@ mod tests {
             ]
         );
 
+        assert_eq!(
+            encode(ProtoEvent::EnterAt {
+                pos: Position::Left,
+                ratio: 0.5,
+            }),
+            [
+                EventType::EnterAt as u8,
+                Position::Left as u8,
+                0x3f,
+                0xe0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0, // ratio = 0.5
+            ]
+        );
+        assert_eq!(
+            encode(ProtoEvent::LeaveAt {
+                serial: 7,
+                ratio: 0.5,
+            }),
+            [
+                EventType::LeaveAt as u8,
+                0,
+                0,
+                0,
+                7, // serial
+                0x3f,
+                0xe0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0, // ratio = 0.5
+            ]
+        );
+
         // clipboard packets use a reserved id outside the EventType range,
         // followed by a big-endian payload length
         assert_eq!(
@@ -578,6 +654,7 @@ mod tests {
         assert_eq!(MAX_CLIPBOARD_TEXT_SIZE, 16 * 1024);
         assert_eq!(MAX_WIRE_SIZE, 5 + 16 * 1024);
         assert_eq!(CAPABILITY_CLIPBOARD_TEXT, 1);
+        assert_eq!(CAPABILITY_ENTER_POSITION, 2);
     }
 
     #[test]
@@ -595,6 +672,14 @@ mod tests {
             ProtoEvent::Hello {
                 commit: *b"01234567",
                 capabilities: u32::MAX,
+            },
+            ProtoEvent::EnterAt {
+                pos: Position::Right,
+                ratio: 0.75,
+            },
+            ProtoEvent::LeaveAt {
+                serial: 0,
+                ratio: 0.25,
             },
             ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
                 time: 42,
