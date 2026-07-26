@@ -204,13 +204,16 @@ impl CrossDeskApp {
 
         if self.macos_restart_required {
             ui.add_space(8.0);
-            Frame::new()
-                .fill(Color32::from_rgb(120, 78, 8))
-                .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(120, 78, 8))
+                .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
                 .inner_margin(12)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.colored_label(Color32::WHITE, "权限已更新，需要重启 CrossDesk 后生效");
+                        ui.colored_label(
+                            egui::Color32::WHITE,
+                            "权限已更新，需要重启 CrossDesk 后生效",
+                        );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.button("立即重启").clicked() {
                                 macos_privacy::relaunch_bundle();
