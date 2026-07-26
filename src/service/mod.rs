@@ -401,11 +401,12 @@ impl Service {
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
-            ICaptureEvent::CaptureBegin(target) => {
+            ICaptureEvent::CaptureBegin { target, ratio } => {
                 // we entered the capture zone for an incoming connection
-                // => notify it that its capture should be released
+                // => notify it that its capture should be released, telling
+                // it where along the barrier the cursor crossed
                 if let Some(addr) = self.incoming.addr_of(target) {
-                    self.emulation.send_leave_event(addr);
+                    self.emulation.send_leave_event(addr, ratio);
                 }
             }
             ICaptureEvent::CaptureDisabled => {

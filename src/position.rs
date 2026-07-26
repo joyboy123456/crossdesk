@@ -32,37 +32,51 @@ pub(crate) fn proto_to_ipc(pos: lan_mouse_proto::Position) -> lan_mouse_ipc::Pos
     }
 }
 
+pub(crate) fn proto_to_emulation(pos: lan_mouse_proto::Position) -> input_emulation::Position {
+    match pos {
+        lan_mouse_proto::Position::Left => input_emulation::Position::Left,
+        lan_mouse_proto::Position::Right => input_emulation::Position::Right,
+        lan_mouse_proto::Position::Top => input_emulation::Position::Top,
+        lan_mouse_proto::Position::Bottom => input_emulation::Position::Bottom,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn position_conversions_round_trip() {
-        for (ipc, capture, proto) in [
+        for (ipc, capture, proto, emulation) in [
             (
                 lan_mouse_ipc::Position::Left,
                 input_capture::Position::Left,
                 lan_mouse_proto::Position::Left,
+                input_emulation::Position::Left,
             ),
             (
                 lan_mouse_ipc::Position::Right,
                 input_capture::Position::Right,
                 lan_mouse_proto::Position::Right,
+                input_emulation::Position::Right,
             ),
             (
                 lan_mouse_ipc::Position::Top,
                 input_capture::Position::Top,
                 lan_mouse_proto::Position::Top,
+                input_emulation::Position::Top,
             ),
             (
                 lan_mouse_ipc::Position::Bottom,
                 input_capture::Position::Bottom,
                 lan_mouse_proto::Position::Bottom,
+                input_emulation::Position::Bottom,
             ),
         ] {
             assert_eq!(ipc_to_capture(ipc), capture);
             assert_eq!(capture_to_proto(capture), proto);
             assert_eq!(proto_to_ipc(proto), ipc);
+            assert_eq!(proto_to_emulation(proto), emulation);
         }
     }
 }

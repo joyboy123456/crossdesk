@@ -10,7 +10,7 @@ use input_capture::{
 };
 use input_event::{Event, KeyboardEvent, scancode};
 use lan_mouse_ipc::ClientHandle;
-use lan_mouse_proto::{ProtoEvent, WireEvent};
+use lan_mouse_proto::{CAPABILITY_ENTER_POSITION, ProtoEvent, WireEvent};
 use tokio::task::spawn_local;
 use tokio_util::sync::CancellationToken;
 
@@ -69,8 +69,12 @@ impl CaptureTarget {
 }
 
 pub(crate) enum ICaptureEvent {
-    /// a capture barrier was entered
-    CaptureBegin(CaptureTarget),
+    /// a capture barrier was entered; `ratio` is the crossing point along
+    /// the barrier edge (normalized, top/left = 0.0), if known
+    CaptureBegin {
+        target: CaptureTarget,
+        ratio: Option<f64>,
+    },
     /// capture disabled
     CaptureDisabled,
     /// capture disabled
@@ -136,6 +140,7 @@ impl Capture {
             state: Default::default(),
             switch_started_at: None,
             clipboard_text: None,
+            active_ratio: None,
         };
         let task = TaskHandle::new(cancellation_token, spawn_local(capture_task.run()));
         Self {
@@ -234,6 +239,9 @@ struct CaptureTask {
     state: State,
     switch_started_at: Option<Timestamp>,
     clipboard_text: Option<String>,
+    /// where the active client was entered along the barrier edge
+    /// (normalized); used for Enter retransmissions while waiting for Ack
+    active_ratio: Option<f64>,
 }
 
 impl CaptureTask {
@@ -377,6 +385,11 @@ impl CaptureTask {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture, None).await?;
                         },
+                        ProtoEvent::LeaveAt { ratio, .. } => {
+                            log::info!("releasing capture: left remote client device region at {ratio:.3}");
+                            let ratio = ratio.is_finite().then(|| ratio.clamp(0.0, 1.0));
+                            self.release_capture(capture, ratio).await?;
+                        },
                         _ => {}
                     }
                 },
@@ -432,11 +445,14 @@ impl CaptureTask {
             return Ok(());
         };
 
-        if matches!(event, CaptureEvent::Begin { .. }) {
+        if let CaptureEvent::Begin { ratio } = event {
             send(
                 &self.event_tx,
                 "capture begin",
-                ICaptureEvent::CaptureBegin(CaptureTarget::from_raw(handle)),
+                ICaptureEvent::CaptureBegin {
+                    target: CaptureTarget::from_raw(handle),
+                    ratio,
+                },
             );
         }
 
@@ -453,24 +469,41 @@ impl CaptureTask {
         }
 
         // activated a new client
-        if matches!(event, CaptureEvent::Begin { .. }) && Some(handle) != self.active_client {
-            self.active_client.replace(handle);
-            self.switch_started_at = Some(Timestamp::now());
-            self.set_state(State::WaitingForAck, "edge_entered");
-            send(
-                &self.event_tx,
-                "client entered",
-                ICaptureEvent::ClientEntered(handle),
-            );
+        if let CaptureEvent::Begin { ratio } = event {
+            self.active_ratio = ratio;
+            if Some(handle) != self.active_client {
+                self.active_client.replace(handle);
+                self.switch_started_at = Some(Timestamp::now());
+                self.set_state(State::WaitingForAck, "edge_entered");
+                send(
+                    &self.event_tx,
+                    "client entered",
+                    ICaptureEvent::ClientEntered(handle),
+                );
+            }
         }
 
         let opposite_pos = capture_to_proto(pos.opposite());
 
+        // Prefer the position-carrying Enter when we know the crossing point
+        // and the peer supports it. The first Enter may still go out as the
+        // legacy event while the peer's Hello is in flight; the WaitingForAck
+        // retransmissions upgrade to EnterAt once capabilities are known.
+        let enter_event = match self.active_ratio {
+            Some(ratio) if self.conn.supports(handle, CAPABILITY_ENTER_POSITION) => {
+                ProtoEvent::EnterAt {
+                    pos: opposite_pos,
+                    ratio,
+                }
+            }
+            _ => ProtoEvent::Enter(opposite_pos),
+        };
+
         let event = match event {
-            CaptureEvent::Begin { .. } => ProtoEvent::Enter(opposite_pos),
+            CaptureEvent::Begin { .. } => enter_event,
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
+                State::WaitingForAck => enter_event,
                 State::Sending => ProtoEvent::Input(e),
             },
         };
@@ -500,6 +533,7 @@ impl CaptureTask {
         edge_ratio: Option<f64>,
     ) -> Result<(), CaptureError> {
         self.switch_started_at = None;
+        self.active_ratio = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Synthesize key-up events for every key still held in the

@@ -7,8 +7,8 @@ use crate::{
 };
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{
-    CAPABILITY_CLIPBOARD_TEXT, MAX_EVENT_SIZE, MAX_WIRE_SIZE, ProtoEvent, ProtocolError, WireEvent,
-    decode_wire_event, encode_clipboard_text,
+    CAPABILITY_CLIPBOARD_TEXT, CAPABILITY_ENTER_POSITION, MAX_EVENT_SIZE, MAX_WIRE_SIZE,
+    ProtoEvent, ProtocolError, WireEvent, decode_wire_event, encode_clipboard_text,
 };
 use std::{
     cell::RefCell,
@@ -207,6 +207,14 @@ impl Connection {
         self.recv_rx.recv().await
     }
 
+    /// whether the peer behind `handle` advertised the given capability bit
+    pub(crate) fn supports(&self, handle: ClientHandle, capability: u32) -> bool {
+        self.ctx
+            .client_manager
+            .active_addr(handle)
+            .is_some_and(|addr| self.ctx.peer_capabilities.supports(addr, capability))
+    }
+
     pub(crate) async fn send(
         &self,
         event: ProtoEvent,
@@ -355,7 +363,7 @@ async fn connect_to_handle(
         // per the forward-compat handler in [`receive_loop`].
         let (buf, len) = ProtoEvent::Hello {
             commit: local_commit(),
-            capabilities: CAPABILITY_CLIPBOARD_TEXT,
+            capabilities: CAPABILITY_CLIPBOARD_TEXT | CAPABILITY_ENTER_POSITION,
         }
         .into();
         if let Err(e) = conn.send(&buf[..len]).await {

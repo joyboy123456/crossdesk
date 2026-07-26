@@ -256,6 +256,11 @@ impl DtlsListener {
         self.peer_capabilities.set(addr, capabilities);
     }
 
+    /// whether the peer at `addr` advertised the given capability bit
+    pub(crate) fn peer_supports(&self, addr: SocketAddr, capability: u32) -> bool {
+        self.peer_capabilities.supports(addr, capability)
+    }
+
     pub(crate) async fn send_clipboard(&self, addr: SocketAddr, text: &str) {
         if !self
             .peer_capabilities

@@ -2,13 +2,15 @@ use crate::{
     config::local_commit,
     listen::{DtlsListener, ListenEvent, ListenerCreationError},
     observability::{self, Timestamp},
-    position::proto_to_ipc,
+    position::{proto_to_emulation, proto_to_ipc},
     task::{DropGuard, Receiver, Sender, TaskHandle, channel, send},
 };
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
-use lan_mouse_proto::{CAPABILITY_CLIPBOARD_TEXT, ProtoEvent, WireEvent};
+use lan_mouse_proto::{
+    CAPABILITY_CLIPBOARD_TEXT, CAPABILITY_ENTER_POSITION, ProtoEvent, WireEvent,
+};
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -82,7 +84,7 @@ pub(crate) enum EmulationEvent {
 
 enum EmulationRequest {
     Reenable,
-    Release(SocketAddr),
+    Release(SocketAddr, Option<f64>),
     ChangePort(u16),
     SetClipboard {
         text: Option<String>,
@@ -112,11 +114,11 @@ impl Emulation {
         }
     }
 
-    pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
+    pub(crate) fn send_leave_event(&self, addr: SocketAddr, edge_ratio: Option<f64>) {
         send(
             &self.request_tx,
             "leave notification",
-            EmulationRequest::Release(addr),
+            EmulationRequest::Release(addr, edge_ratio),
         );
     }
 
@@ -189,6 +191,22 @@ impl ListenTask {
                                             send(&self.event_tx, "peer entered", EmulationEvent::Entered{addr, pos: proto_to_ipc(pos), fingerprint});
                                         }
                                     }
+                                    ProtoEvent::EnterAt { pos, ratio } => {
+                                        if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                                            log::info!("releasing capture: {addr} entered this device (at {ratio:.3})");
+                                            send(&self.event_tx, "release notification", EmulationEvent::ReleaseNotify);
+                                            self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                            send(&self.event_tx, "peer entered", EmulationEvent::Entered{addr, pos: proto_to_ipc(pos), fingerprint});
+                                            // place the cursor where the remote cursor crossed
+                                            // the barrier. Deliberately not deduplicated by
+                                            // handle: repeated EnterAt only happens before the
+                                            // Ack is processed (no Motion in between), so
+                                            // re-placing is idempotent.
+                                            if ratio.is_finite() {
+                                                self.emulation_proxy.enter(proto_to_emulation(pos), ratio.clamp(0.0, 1.0), addr);
+                                            }
+                                        }
+                                    }
                                     ProtoEvent::Leave(_) => {
                                         self.emulation_proxy.remove(addr);
                                         self.listener.reply(addr, ProtoEvent::Ack(0)).await;
@@ -199,7 +217,7 @@ impl ListenTask {
                                         self.listener.set_peer_capabilities(addr, capabilities);
                                         self.listener.reply(addr, ProtoEvent::Hello {
                                             commit: local_commit(),
-                                            capabilities: CAPABILITY_CLIPBOARD_TEXT,
+                                            capabilities: CAPABILITY_CLIPBOARD_TEXT | CAPABILITY_ENTER_POSITION,
                                         }).await;
                                         if capabilities & CAPABILITY_CLIPBOARD_TEXT != 0 {
                                             if let Some(text) = self.clipboard_text.as_deref() {
@@ -233,7 +251,15 @@ impl ListenTask {
                     // reenable emulation
                     Some(EmulationRequest::Reenable) => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    Some(EmulationRequest::Release(addr)) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    Some(EmulationRequest::Release(addr, edge_ratio)) => {
+                        let event = match edge_ratio {
+                            Some(ratio) if self.listener.peer_supports(addr, CAPABILITY_ENTER_POSITION) => {
+                                ProtoEvent::LeaveAt { serial: 0, ratio }
+                            }
+                            _ => ProtoEvent::Leave(0),
+                        };
+                        self.listener.reply(addr, event).await
+                    }
                     Some(EmulationRequest::ChangePort(port)) => {
                         self.listener.request_port_change(port);
                         match self.listener.port_changed().await {
@@ -281,6 +307,8 @@ pub(crate) struct EmulationProxy {
 
 enum ProxyRequest {
     Input(Event, SocketAddr, Timestamp),
+    /// place the cursor at `ratio` along the entered edge
+    Enter(input_emulation::Position, f64, SocketAddr),
     Remove(SocketAddr),
     Reenable,
 }
@@ -345,6 +373,17 @@ impl EmulationProxy {
         }
     }
 
+    fn enter(&self, pos: input_emulation::Position, ratio: f64, addr: SocketAddr) {
+        // ignore if emulation is currently disabled, same as input events
+        if self.emulation_active.get() {
+            send(
+                &self.request_tx,
+                "enter event",
+                ProxyRequest::Enter(pos, ratio, addr),
+            );
+        }
+    }
+
     fn remove(&self, addr: SocketAddr) {
         send(&self.request_tx, "peer removal", ProxyRequest::Remove(addr));
     }
@@ -395,6 +434,7 @@ impl EmulationTask {
                     ProxyRequest::Input(event, ..) => {
                         observability::record_emulation_inactive_drop(&event);
                     }
+                    ProxyRequest::Enter(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
@@ -428,6 +468,23 @@ impl EmulationTask {
         res
     }
 
+    async fn get_or_create_handle(
+        &mut self,
+        emulation: &mut InputEmulation,
+        addr: SocketAddr,
+    ) -> EmulationHandle {
+        match self.handles.get(&addr) {
+            Some(&handle) => handle,
+            None => {
+                let handle = self.next_id;
+                self.next_id += 1;
+                emulation.create(handle).await;
+                self.handles.insert(addr, handle);
+                handle
+            }
+        }
+    }
+
     async fn create_clients(
         &mut self,
         emulation: &mut InputEmulation,
@@ -455,20 +512,15 @@ impl EmulationTask {
                     request.record_dequeued();
                     match request {
                     ProxyRequest::Input(event, addr, received_at) => {
-                        let handle = match self.handles.get(&addr) {
-                            Some(&handle) => handle,
-                            None => {
-                                let handle = self.next_id;
-                                self.next_id += 1;
-                                emulation.create(handle).await;
-                                self.handles.insert(addr, handle);
-                                handle
-                            }
-                        };
+                        let handle = self.get_or_create_handle(&mut *emulation, addr).await;
                         let result = emulation.consume(event, handle).await;
                         observability::record_receive_to_inject(received_at);
                         result?;
                     },
+                    ProxyRequest::Enter(pos, ratio, addr) => {
+                        let handle = self.get_or_create_handle(&mut *emulation, addr).await;
+                        emulation.enter(handle, pos, ratio).await;
+                    }
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
