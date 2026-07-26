@@ -25,6 +25,13 @@ use crate::{
 /// down does not flood the log with one line per captured input event
 const RELEASE_LOG_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// how long the capture may stay in [`State::WaitingForAck`] before it is
+/// force-released. Without this, a peer that receives our Enter but never
+/// acknowledges it would leave the local mouse captured (and frozen)
+/// indefinitely - the input black-hole can only be escaped via the release
+/// bind, which users may not know.
+const ENTER_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub(crate) struct Capture {
     task: TaskHandle,
     request_tx: Sender<CaptureRequest>,
@@ -141,6 +148,7 @@ impl Capture {
             switch_started_at: None,
             clipboard_text: None,
             active_ratio: None,
+            waiting_for_ack_since: None,
         };
         let task = TaskHandle::new(cancellation_token, spawn_local(capture_task.run()));
         Self {
@@ -242,6 +250,9 @@ struct CaptureTask {
     /// where the active client was entered along the barrier edge
     /// (normalized); used for Enter retransmissions while waiting for Ack
     active_ratio: Option<f64>,
+    /// when the task entered [`State::WaitingForAck`]; releases the capture
+    /// after [`ENTER_ACK_TIMEOUT`]
+    waiting_for_ack_since: Option<Instant>,
 }
 
 impl CaptureTask {
@@ -374,6 +385,7 @@ impl CaptureTask {
                         // connection acknowlegded => set state to Sending
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
+                            self.waiting_for_ack_since = None;
                             self.set_state(State::Sending, "enter_acknowledged");
                             if let Some(started_at) = self.switch_started_at.take() {
                                 observability::record_switch_ack(started_at);
@@ -474,6 +486,7 @@ impl CaptureTask {
             if Some(handle) != self.active_client {
                 self.active_client.replace(handle);
                 self.switch_started_at = Some(Timestamp::now());
+                self.waiting_for_ack_since = Some(Instant::now());
                 self.set_state(State::WaitingForAck, "edge_entered");
                 send(
                     &self.event_tx,
@@ -481,6 +494,19 @@ impl CaptureTask {
                     ICaptureEvent::ClientEntered(handle),
                 );
             }
+        }
+
+        // a peer that never acknowledges the Enter would otherwise keep the
+        // local mouse captured forever
+        if self.state == State::WaitingForAck
+            && self
+                .waiting_for_ack_since
+                .is_some_and(|since| since.elapsed() > ENTER_ACK_TIMEOUT)
+        {
+            log::warn!(
+                "releasing capture: client {handle} did not acknowledge the connection within {ENTER_ACK_TIMEOUT:?}"
+            );
+            return self.release_capture(capture, None).await;
         }
 
         let opposite_pos = capture_to_proto(pos.opposite());
@@ -534,6 +560,7 @@ impl CaptureTask {
     ) -> Result<(), CaptureError> {
         self.switch_started_at = None;
         self.active_ratio = None;
+        self.waiting_for_ack_since = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Synthesize key-up events for every key still held in the

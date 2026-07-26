@@ -13,7 +13,7 @@ use lan_mouse_proto::{
 };
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -105,6 +105,7 @@ impl Emulation {
             event_tx,
             clipboard_text: None,
             cancellation_token: cancellation_token.clone(),
+            entered: HashSet::new(),
         };
         let task = TaskHandle::new(cancellation_token, spawn_local(emulation_task.run()));
         Self {
@@ -164,6 +165,9 @@ struct ListenTask {
     event_tx: Sender<EmulationEvent>,
     clipboard_text: Option<String>,
     cancellation_token: CancellationToken,
+    /// peers currently controlling this device (Enter accepted, no Leave
+    /// yet); they are kicked with a Leave when emulation becomes unavailable
+    entered: HashSet<SocketAddr>,
 }
 
 impl ListenTask {
@@ -185,29 +189,36 @@ impl ListenTask {
                                 match event {
                                     ProtoEvent::Enter(pos) => {
                                         if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
-                                            log::info!("releasing capture: {addr} entered this device");
-                                            send(&self.event_tx, "release notification", EmulationEvent::ReleaseNotify);
-                                            self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                            send(&self.event_tx, "peer entered", EmulationEvent::Entered{addr, pos: proto_to_ipc(pos), fingerprint});
+                                            if !self.reject_enter_if_emulation_unavailable(addr).await {
+                                                log::info!("releasing capture: {addr} entered this device");
+                                                send(&self.event_tx, "release notification", EmulationEvent::ReleaseNotify);
+                                                self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                                self.entered.insert(addr);
+                                                send(&self.event_tx, "peer entered", EmulationEvent::Entered{addr, pos: proto_to_ipc(pos), fingerprint});
+                                            }
                                         }
                                     }
                                     ProtoEvent::EnterAt { pos, ratio } => {
                                         if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
-                                            log::info!("releasing capture: {addr} entered this device (at {ratio:.3})");
-                                            send(&self.event_tx, "release notification", EmulationEvent::ReleaseNotify);
-                                            self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                            send(&self.event_tx, "peer entered", EmulationEvent::Entered{addr, pos: proto_to_ipc(pos), fingerprint});
-                                            // place the cursor where the remote cursor crossed
-                                            // the barrier. Deliberately not deduplicated by
-                                            // handle: repeated EnterAt only happens before the
-                                            // Ack is processed (no Motion in between), so
-                                            // re-placing is idempotent.
-                                            if ratio.is_finite() {
-                                                self.emulation_proxy.enter(proto_to_emulation(pos), ratio.clamp(0.0, 1.0), addr);
+                                            if !self.reject_enter_if_emulation_unavailable(addr).await {
+                                                log::info!("releasing capture: {addr} entered this device (at {ratio:.3})");
+                                                send(&self.event_tx, "release notification", EmulationEvent::ReleaseNotify);
+                                                self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                                self.entered.insert(addr);
+                                                send(&self.event_tx, "peer entered", EmulationEvent::Entered{addr, pos: proto_to_ipc(pos), fingerprint});
+                                                // place the cursor where the remote cursor crossed
+                                                // the barrier. Deliberately not deduplicated by
+                                                // handle: repeated EnterAt only happens before the
+                                                // Ack is processed (no Motion in between), so
+                                                // re-placing is idempotent.
+                                                if ratio.is_finite() {
+                                                    self.emulation_proxy.enter(proto_to_emulation(pos), ratio.clamp(0.0, 1.0), addr);
+                                                }
                                             }
                                         }
                                     }
                                     ProtoEvent::Leave(_) => {
+                                        self.entered.remove(&addr);
                                         self.emulation_proxy.remove(addr);
                                         self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     }
@@ -243,7 +254,19 @@ impl ListenTask {
                     None => break
                 }}
                 event = self.emulation_proxy.event() => match event {
-                    Some(event) => send(&self.event_tx, "emulation event", event),
+                    Some(event) => {
+                        // emulation just became unavailable (backend gone or
+                        // permissions lost): kick every peer currently
+                        // controlling us, otherwise their cursor stays
+                        // captured aiming at a black hole
+                        if matches!(event, EmulationEvent::EmulationDisabled) {
+                            for addr in std::mem::take(&mut self.entered) {
+                                log::warn!("emulation became unavailable, kicking {addr}");
+                                self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                            }
+                        }
+                        send(&self.event_tx, "emulation event", event)
+                    }
                     None => break,
                 },
                 request = self.request_rx.recv() => match request {
@@ -277,9 +300,11 @@ impl ListenTask {
                     }
                 },
                 _ = interval.tick() => {
+                    let entered = &mut self.entered;
                     last_response.retain(|&addr,instant| {
                         if instant.elapsed() > PEER_TIMEOUT {
                             log::warn!("releasing keys: {addr} not responding!");
+                            entered.remove(&addr);
                             self.emulation_proxy.remove(addr);
                             send(&self.event_tx, "peer disconnected", EmulationEvent::Disconnected { addr });
                             false
@@ -293,6 +318,24 @@ impl ListenTask {
         }
         self.listener.terminate().await;
         self.emulation_proxy.terminate().await;
+    }
+
+    /// If input emulation is currently unavailable (no backend or missing
+    /// permissions), refuse the Enter by replying with a Leave so the
+    /// controlling side releases its capture immediately. Without this the
+    /// controller acks into a black hole: its mouse is captured and every
+    /// event goes to an emulator that cannot move the local cursor, so the
+    /// return barrier is never reached and the controller's mouse stays
+    /// frozen until the connection dies.
+    ///
+    /// Returns true if the Enter was rejected.
+    async fn reject_enter_if_emulation_unavailable(&mut self, addr: SocketAddr) -> bool {
+        if self.emulation_proxy.emulation_active.get() {
+            return false;
+        }
+        log::warn!("rejecting enter from {addr}: input emulation is unavailable");
+        self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+        true
     }
 }
 
