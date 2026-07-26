@@ -1,6 +1,12 @@
 use super::{Emulation, EmulationHandle, error::EmulationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
+use core_foundation::base::TCFType;
+use core_foundation::string::CFString;
+use core_foundation_sys::base::Boolean;
+use core_foundation_sys::preferences::{
+    CFPreferencesGetAppBooleanValue, kCFPreferencesAnyApplication,
+};
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
     CGDirectDisplayID, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
@@ -28,11 +34,59 @@ const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Convert the protocol's scroll convention (positive = down/right) to
-/// CoreGraphics' opposite convention. HID-posted events are not affected by
-/// the receiver's natural-scrolling preference.
-fn wire_scroll_to_cgevent(value: i32) -> i32 {
-    value.saturating_neg()
+/// Convert the protocol's scroll convention (positive = down/right) to a
+/// CoreGraphics scroll delta. CG's base convention is the opposite sign,
+/// *but* HID-posted synthetic events bypass the natural-scrolling flip the
+/// system applies to real devices, so that flip is applied here as well:
+/// with natural scrolling ON the two negations cancel (identity), with it
+/// OFF the net effect is a single negation.
+fn wire_scroll_to_cgevent(value: i32, natural_scrolling: bool) -> i32 {
+    if natural_scrolling {
+        value
+    } else {
+        value.saturating_neg()
+    }
+}
+
+/// Reads the system natural-scrolling preference
+/// (`com.apple.swipescrolldirection` in the Apple Global Domain).
+/// The key is absent on a freshly set-up account; natural scrolling
+/// defaults to ON in that case.
+fn read_natural_scrolling() -> bool {
+    let key = CFString::from_static_string("com.apple.swipescrolldirection");
+    let mut exists: Boolean = 0;
+    let value = unsafe {
+        CFPreferencesGetAppBooleanValue(
+            key.as_concrete_TypeRef(),
+            kCFPreferencesAnyApplication,
+            &mut exists,
+        )
+    };
+    if exists != 0 { value != 0 } else { true }
+}
+
+const NATURAL_SCROLL_TTL: Duration = Duration::from_secs(1);
+
+/// TTL cache so momentum scrolling doesn't hit CFPreferences per event.
+struct NaturalScrollCache {
+    cached: Option<(Instant, bool)>,
+}
+
+impl NaturalScrollCache {
+    fn new() -> Self {
+        Self { cached: None }
+    }
+
+    fn get(&mut self) -> bool {
+        match self.cached {
+            Some((at, v)) if at.elapsed() < NATURAL_SCROLL_TTL => v,
+            _ => {
+                let v = read_natural_scrolling();
+                self.cached = Some((Instant::now(), v));
+                v
+            }
+        }
+    }
 }
 
 pub(crate) struct MacOSEmulation {
@@ -52,6 +106,8 @@ pub(crate) struct MacOSEmulation {
     modifier_state: Rc<Cell<XMods>>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
+    /// cached natural-scrolling preference of this host
+    natural_scroll: NaturalScrollCache,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -81,6 +137,7 @@ impl MacOSEmulation {
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            natural_scroll: NaturalScrollCache::new(),
         })
     }
 
@@ -427,7 +484,7 @@ impl Emulation for MacOSEmulation {
                         axis,
                         value,
                     } => {
-                        let value = wire_scroll_to_cgevent(value as i32);
+                        let value = wire_scroll_to_cgevent(value as i32, self.natural_scroll.get());
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value, 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value, 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
@@ -454,7 +511,7 @@ impl Emulation for MacOSEmulation {
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         const LINES_PER_STEP: i32 = 3;
-                        let value = wire_scroll_to_cgevent(value);
+                        let value = wire_scroll_to_cgevent(value, self.natural_scroll.get());
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value / (120 / LINES_PER_STEP), 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value / (120 / LINES_PER_STEP), 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
@@ -614,10 +671,18 @@ mod tests {
     use super::wire_scroll_to_cgevent;
 
     #[test]
-    fn converts_wire_scroll_direction_to_core_graphics() {
-        assert_eq!(wire_scroll_to_cgevent(120), -120);
-        assert_eq!(wire_scroll_to_cgevent(-120), 120);
-        assert_eq!(wire_scroll_to_cgevent(0), 0);
-        assert_eq!(wire_scroll_to_cgevent(i32::MIN), i32::MAX);
+    fn inverts_wire_scroll_when_natural_scrolling_off() {
+        assert_eq!(wire_scroll_to_cgevent(120, false), -120);
+        assert_eq!(wire_scroll_to_cgevent(-120, false), 120);
+        assert_eq!(wire_scroll_to_cgevent(0, false), 0);
+        assert_eq!(wire_scroll_to_cgevent(i32::MIN, false), i32::MAX);
+    }
+
+    #[test]
+    fn passes_wire_scroll_through_when_natural_scrolling_on() {
+        assert_eq!(wire_scroll_to_cgevent(120, true), 120);
+        assert_eq!(wire_scroll_to_cgevent(-120, true), -120);
+        assert_eq!(wire_scroll_to_cgevent(0, true), 0);
+        assert_eq!(wire_scroll_to_cgevent(i32::MIN, true), i32::MIN);
     }
 }
