@@ -3,7 +3,7 @@
 ## Events
 
 Each instance of lan-mouse can emit and receive events, where
-an event is either a mouse or keyboard event for now.
+an event is a mouse event, keyboard event, or negotiated clipboard text update.
 
 The general Architecture is shown in the following flow chart:
 ```mermaid
@@ -34,6 +34,14 @@ the standardized event format.
 ### Dispatcher
 The dispatcher component takes events from the event receiver and passes them
 to the correct backend corresponding to the type of client.
+
+### Clipboard
+
+The service polls the platform clipboard on a dedicated worker thread and forwards changed UTF-8
+text to authenticated peers. Remote writes update the worker's last-seen value, which prevents the
+same text from bouncing between devices. Clipboard packets are limited to 16 KiB and are sent only
+after the peer advertises the clipboard capability in the backward-compatible Hello exchange.
+Platform clipboard access never runs on the input capture, emulation, or GUI thread.
 
 
 ## Requests

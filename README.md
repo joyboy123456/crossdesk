@@ -15,13 +15,7 @@ Focus lies on performance, ease of use and a maintainable implementation that ca
 
 ***blazingly fast™*** because it's written in rust.
 
-- _Now with a gtk frontend_
-
-<picture>
-    <source media="(prefers-color-scheme: dark)" srcset="/screenshots/dark.png?raw=true">
-    <source media="(prefers-color-scheme: light)" srcset="/screenshots/light.png?raw=true">
-    <img alt="Screenshot of Lan-Mouse" srcset="/screenshots/dark.png">
-</picture>
+- _Now with the native CrossDesk egui frontend on Windows and macOS_
 
 
 ## Encryption
@@ -103,10 +97,10 @@ dnf install lan-mouse
 
 - Download the package for your Mac (Intel or ARM) from the releases page
 - Unzip it
-- Remove the quarantine with `xattr -rd com.apple.quarantine "Lan Mouse.app"`
+- Remove the quarantine with `xattr -rd com.apple.quarantine "CrossDesk.app"`
 - Launch the app
-- Use the menu bar item to open the settings window or quit Lan Mouse. Bundled macOS builds run as a menu bar app and do not keep a Dock icon visible.
-- Grant accessibility permissions in System Preferences
+- Use the menu bar item to open the settings window or quit CrossDesk. Bundled macOS builds run as a menu bar app and do not keep a Dock icon visible.
+- Grant Accessibility and Input Monitoring permissions when prompted, then restart CrossDesk from the settings page.
 
 </details>
 
@@ -119,7 +113,7 @@ First make sure to [install the necessary dependencies](#installing-dependencies
 Precompiled release binaries for Windows, MacOS and Linux are available in the [releases section](https://github.com/feschber/lan-mouse/releases).
 For Windows, the depenedencies are included in the .zip file, for other operating systems see [Installing Dependencies](#installing-dependencies-for-development--compiling-from-source).
 
-Alternatively, the `lan-mouse` binary can be compiled from source (see below).
+Alternatively, the `crossdesk` GUI and compatible `lan-mouse` CLI can be compiled from source (see below).
 
 ### Installing desktop file, app icon and firewall rules (optional)
 ```sh
@@ -147,11 +141,12 @@ can be easily compiled via cargo or nix:
 
 ### Compiling and installing manually:
 ```sh
-# compile in release mode
-cargo build --release
+# build the CrossDesk GUI and the compatible lan-mouse CLI
+cargo build --release --bins
 
-# install lan-mouse
-sudo cp target/release/lan-mouse /usr/local/bin/
+# Windows GUI: target/release/crossdesk.exe
+# macOS/Linux GUI: target/release/crossdesk
+# daemon/CLI: target/release/lan-mouse
 ```
 
 ### Compiling and installing via cargo:
@@ -169,7 +164,7 @@ nix-build
 Support for other platforms is omitted automatically based on the active
 rust toolchain.
 
-Additionally, available backends and frontends can be configured manually via
+Additionally, available backends and the frontend can be configured manually via
 [cargo features](https://doc.rust-lang.org/cargo/reference/features.html).
 
 E.g. if only support for sway is needed, the following command produces
@@ -177,6 +172,10 @@ an executable with support for only the `layer-shell` capture backend
 and `wlroots` emulation backend:
 ```sh
 cargo build --no-default-features --features layer_shell_capture,wlroots_emulation
+```
+To build only the daemon/CLI without any GUI dependency:
+```sh
+cargo build --release -p lan-mouse --no-default-features
 ```
 For a detailed list of available features, checkout the [Cargo.toml](./Cargo.toml)
 </details>
@@ -208,15 +207,13 @@ The `pre-commit` script runs `cargo fmt --all` (and fails if files were modified
     <summary>MacOS</summary>
 
 ```sh
-# Install dependencies
-brew install libadwaita pkg-config imagemagick
+# Install bundling tools (the GUI itself has no GTK/libadwaita dependency)
+brew install imagemagick
 cargo install cargo-bundle
 # Create the macOS icon file
 scripts/makeicns.sh
-# Create the .app bundle
-cargo bundle
-# Copy all dynamic libraries into the bundle, and update the bundle to find them there
-scripts/copy-macos-dylib.sh
+# Create CrossDesk.app
+cargo bundle --release --bin crossdesk
 ```
 </details>
 
@@ -224,7 +221,7 @@ scripts/copy-macos-dylib.sh
     <summary>Ubuntu and derivatives</summary>
 
 ```sh
-sudo apt install libadwaita-1-dev libgtk-4-dev libx11-dev libxtst-dev
+sudo apt install libx11-dev libxtst-dev
 ```
 </details>
 
@@ -232,7 +229,7 @@ sudo apt install libadwaita-1-dev libgtk-4-dev libx11-dev libxtst-dev
     <summary>Arch and derivatives</summary>
 
 ```sh
-sudo pacman -S libadwaita gtk libx11 libxtst
+sudo pacman -S libx11 libxtst
 ```
 </details>
 
@@ -240,7 +237,7 @@ sudo pacman -S libadwaita gtk libx11 libxtst
     <summary>Fedora and derivatives</summary>
 
 ```sh
-sudo dnf install libadwaita-devel libXtst-devel libX11-devel
+sudo dnf install libXtst-devel libX11-devel
 ```
 </details>
 <details>
@@ -261,58 +258,21 @@ nix develop
 <details>
     <summary>Windows</summary>
 
-- First install [Rust](https://www.rust-lang.org/tools/install).
-
-- Then follow the instructions at [gtk-rs.org](https://gtk-rs.org/gtk4-rs/stable/latest/book/installation_windows.html)
-
-*TLDR:*
-
-Build gtk from source
-
-- The following commands should be run in an **admin power shell** instance:
-```sh
-# install chocolatey
-Set-ExecutionPolicy Bypass -Scope Process -Force; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-
-# install gvsbuild dependencies
-choco install python git msys2 visualstudio2022-workload-vctools
-```
-
-- The following commands should be run in a **regular power shell** instance:
-
-```sh
-# install gvsbuild with python
-python -m pip install --user pipx
-python -m pipx ensurepath
-```
-
-- Relaunch your powershell instance so the changes in the environment are reflected.
-```sh
-pipx install gvsbuild
-
-# build gtk + libadwaita
-gvsbuild build gtk4 libadwaita librsvg adwaita-icon-theme
-```
-
-- **Make sure to add the directory** `C:\gtk-build\gtk\x64\release\bin`
-[**to the `PATH` environment variable**]((https://learn.microsoft.com/en-us/previous-versions/office/developer/sharepoint-2010/ee537574(v=office.14))). Otherwise the project will fail to build.
-
-To avoid building GTK from source, it is possible to disable
-the gtk frontend (see conditional compilation).
+- Install [Rust](https://www.rust-lang.org/tools/install) with the MSVC toolchain and Visual Studio Build Tools.
+- Run `cargo build --release --bins`.
+- Launch `target/release/crossdesk.exe`. Release GUI builds use the Windows GUI subsystem and do not open a console window.
+- No GTK4, libadwaita, Python, MSYS2, gvsbuild, or extra runtime DLLs are required.
 </details>
 
 ## Usage
 <details>
-    <summary>Gtk Frontend</summary>
+    <summary>CrossDesk Frontend</summary>
 
-By default the gtk frontend will open when running `lan-mouse`.
+By default `cargo run` starts the CrossDesk frontend. You can also run the dedicated `crossdesk` binary. Closing the window keeps it in the Windows tray or macOS menu bar; choose **退出 CrossDesk** to stop the GUI and its owned service safely.
 
-To connect a device you want to control, simply click the `Add` button and enter the hostname
-of the device.
+The **设备** page adds a host or IP and places it to the left, right, top, or bottom of the local screen. Enabled remote screens can also be dragged between the four available slots.
 
-On the *remote* device, authorize your *local* device for incoming traffic using the `Authorize` button
-under the "Incoming Connections" section.
-The fingerprint for authorization can be found under the general section of your *local* device.
+On the remote device, use the **授权** page to approve the local device fingerprint. The local fingerprint is shown on the same page.
 It is of the form "aa:bb:cc:..."
 
 Authorized devices can be persisted using the configuration file (see [Configuration](#configuration)).
@@ -415,8 +375,22 @@ port = 4242
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
 
+### Clipboard synchronization
+
+CrossDesk synchronizes UTF-8 text clipboard changes over the existing encrypted DTLS connection.
+Text synchronization is enabled by default and can be changed in the desktop Settings page or in
+`config.toml`:
+
+```toml
+clipboard_sync = false
+```
+
+Each text value is limited to 16 KiB so clipboard traffic cannot monopolize the input channel.
+Peers negotiate clipboard support during the existing Hello exchange; clipboard packets are never
+sent to older peers that do not advertise support. Images and files are not synchronized yet.
+
 ## Roadmap
-- [x] Graphical frontend (gtk + libadwaita)
+- [x] Graphical frontend (egui/eframe)
 - [x] respect xdg-config-home for config file location.
 - [x] IP Address switching
 - [x] Liveness tracking Automatically ungrab mouse when client unreachable
@@ -429,7 +403,8 @@ Where `left` can be either `left`, `right`, `top` or `bottom`.
 - [ ] X11 Input Capture
 - [ ] Latency measurement and visualization
 - [ ] Bandwidth usage measurement and visualization
-- [ ] Clipboard support
+- [x] UTF-8 text clipboard synchronization
+- [ ] Image and file clipboard synchronization
 
 
 ## Detailed OS Support
