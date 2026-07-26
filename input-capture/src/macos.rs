@@ -855,16 +855,31 @@ fn request_macos_capture_permissions() -> Result<(), MacosCaptureCreationError> 
 }
 
 fn request_accessibility_permission() -> bool {
-    // Silent check. The GUI owns the one-time user-visible prompt at
-    // startup (see crossdesk_ui::macos_privacy) so retries triggered by
-    // clicking the "Reenable" button don't pop a fresh Accessibility
-    // alert every time.
-    unsafe { AXIsProcessTrusted() }
+    // The GUI owns the user-visible prompt at startup (see
+    // crossdesk_ui::macos_privacy), so a silent check is enough while it is
+    // running. A headless daemon has no such owner: unless it asks, macOS
+    // never registers it with TCC and the permission cannot be granted at
+    // all. `prompt_allowed` limits this to one dialog per process, so
+    // clicking "Reenable" repeatedly does not pop a fresh alert every time.
+    if unsafe { AXIsProcessTrusted() } {
+        return true;
+    }
+    if crate::macos_permissions::prompt_allowed() {
+        crate::macos_permissions::prompt_for_accessibility()
+    } else {
+        false
+    }
 }
 
 fn request_input_monitoring_permission() -> bool {
-    // Silent check, same reasoning as above.
-    unsafe { CGPreflightListenEventAccess() }
+    if unsafe { CGPreflightListenEventAccess() } {
+        return true;
+    }
+    if crate::macos_permissions::prompt_allowed() {
+        unsafe { CGRequestListenEventAccess() }
+    } else {
+        false
+    }
 }
 
 impl Drop for MacOSInputCapture {
@@ -943,6 +958,7 @@ extern "C" {
         seconds: CFTimeInterval,
     );
     fn CGPreflightListenEventAccess() -> bool;
+    fn CGRequestListenEventAccess() -> bool;
     /// Re-enable an event tap that was disabled by a
     /// `kCGEventTapDisabledByTimeout` event. The Apple-documented
     /// recovery path: see Quartz Event Services Reference. The `tap`

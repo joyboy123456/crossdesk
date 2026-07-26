@@ -24,6 +24,9 @@ mod libei;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(target_os = "macos")]
+mod macos_permissions;
+
 #[cfg(layer_shell)]
 mod layer_shell;
 

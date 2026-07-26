@@ -213,18 +213,35 @@ fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationErr
 }
 
 fn request_accessibility_permission() -> bool {
-    // Silent check. The GUI owns the one-time user-visible prompt at
-    // startup (see crossdesk_ui::macos_privacy).
-    unsafe { AXIsProcessTrusted() }
+    // The GUI owns the user-visible prompt (see crossdesk_ui::macos_privacy),
+    // so a silent check is enough when it is running. A headless daemon has
+    // no such owner: without asking, macOS never registers this process with
+    // TCC and the permission can never be granted, so prompt there.
+    if unsafe { AXIsProcessTrusted() } {
+        return true;
+    }
+    if crate::macos_permissions::prompt_allowed() {
+        crate::macos_permissions::prompt_for_accessibility()
+    } else {
+        false
+    }
 }
 
 fn request_input_control_permission() -> bool {
-    unsafe { CGPreflightPostEventAccess() }
+    if unsafe { CGPreflightPostEventAccess() } {
+        return true;
+    }
+    if crate::macos_permissions::prompt_allowed() {
+        unsafe { CGRequestPostEventAccess() }
+    } else {
+        false
+    }
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightPostEventAccess() -> bool;
+    fn CGRequestPostEventAccess() -> bool;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
