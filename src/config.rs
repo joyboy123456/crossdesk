@@ -502,35 +502,28 @@ impl Config {
             .unwrap_or(true)
     }
 
+    /// the parsed config file, creating an empty one if none was loaded
+    fn config_toml_mut(&mut self) -> &mut ConfigToml {
+        self.config_toml.get_or_insert_with(Default::default)
+    }
+
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
         if clients.is_empty() {
             return;
         }
-        if self.config_toml.is_none() {
-            self.config_toml = Some(Default::default());
-        }
-        self.config_toml.as_mut().expect("config").clients =
+        self.config_toml_mut().clients =
             Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
     }
 
     /// enable or disable text clipboard synchronization
     pub fn set_clipboard_sync(&mut self, enabled: bool) {
-        if self.config_toml.is_none() {
-            self.config_toml = Some(Default::default());
-        }
-        self.config_toml.as_mut().expect("config").clipboard_sync = Some(enabled);
+        self.config_toml_mut().clipboard_sync = Some(enabled);
     }
 
     /// set authorized keys
     pub fn set_authorized_keys(&mut self, fingerprints: HashMap<String, String>) {
-        if self.config_toml.is_none() {
-            self.config_toml = Some(Default::default());
-        }
-        self.config_toml
-            .as_mut()
-            .expect("config")
-            .authorized_fingerprints = Some(fingerprints);
+        self.config_toml_mut().authorized_fingerprints = Some(fingerprints);
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {

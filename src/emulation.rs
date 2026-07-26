@@ -2,11 +2,13 @@ use crate::{
     config::local_commit,
     listen::{DtlsListener, ListenEvent, ListenerCreationError},
     observability::{self, Timestamp},
+    position::proto_to_ipc,
+    task::DropGuard,
 };
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
-use lan_mouse_proto::{CAPABILITY_CLIPBOARD_TEXT, Position, ProtoEvent, WireEvent};
+use lan_mouse_proto::{CAPABILITY_CLIPBOARD_TEXT, ProtoEvent, WireEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
@@ -19,6 +21,17 @@ use tokio::{
     select,
     task::{JoinHandle, spawn_local},
 };
+
+/// how often connected peers are checked for liveness
+const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// a peer that has not sent anything for this long is considered gone; its
+/// emulation handle is destroyed so held keys do not stick
+const PEER_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// repeated connection attempts from the same unauthorized fingerprint are
+/// reported to the frontend at most once per this interval
+const REJECTED_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
@@ -151,7 +164,7 @@ struct ListenTask {
 
 impl ListenTask {
     async fn run(mut self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(LIVENESS_CHECK_INTERVAL);
         let mut last_response = HashMap::new();
         let mut rejected_connections = HashMap::new();
         loop {
@@ -173,7 +186,7 @@ impl ListenTask {
                                             log::info!("releasing capture: {addr} entered this device");
                                             self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                             self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                            self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                                            self.event_tx.send(EmulationEvent::Entered{addr, pos: proto_to_ipc(pos), fingerprint}).expect("channel closed");
                                         }
                                     }
                                     ProtoEvent::Leave(_) => {
@@ -205,7 +218,7 @@ impl ListenTask {
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
                         if rejected_connections.insert(fingerprint.clone(), Instant::now())
-                            .is_none_or(|i| i.elapsed() >= Duration::from_secs(2)) {
+                            .is_none_or(|i| i.elapsed() >= REJECTED_REPORT_INTERVAL) {
                                 self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
                             }
                     }
@@ -236,7 +249,7 @@ impl ListenTask {
                 },
                 _ = interval.tick() => {
                     last_response.retain(|&addr,instant| {
-                        if instant.elapsed() > Duration::from_secs(1) {
+                        if instant.elapsed() > PEER_TIMEOUT {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
@@ -458,15 +471,6 @@ impl EmulationTask {
     }
 }
 
-fn to_ipc_pos(pos: Position) -> lan_mouse_ipc::Position {
-    match pos {
-        Position::Left => lan_mouse_ipc::Position::Left,
-        Position::Right => lan_mouse_ipc::Position::Right,
-        Position::Top => lan_mouse_ipc::Position::Top,
-        Position::Bottom => lan_mouse_ipc::Position::Bottom,
-    }
-}
-
 async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
     loop {
         let request = rx.recv().await.expect("channel closed");
@@ -479,26 +483,5 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
         }
-    }
-}
-
-struct DropGuard<T> {
-    tx: Sender<T>,
-    on_drop: Option<T>,
-}
-
-impl<T> DropGuard<T> {
-    fn new(tx: Sender<T>, on_new: T, on_drop: T) -> Self {
-        tx.send(on_new).expect("channel closed");
-        let on_drop = Some(on_drop);
-        Self { tx, on_drop }
-    }
-}
-
-impl<T> Drop for DropGuard<T> {
-    fn drop(&mut self) {
-        self.tx
-            .send(self.on_drop.take().expect("item"))
-            .expect("channel closed");
     }
 }

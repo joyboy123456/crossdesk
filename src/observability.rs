@@ -1,6 +1,6 @@
 use input_event::Event;
 #[cfg(feature = "metrics")]
-use input_event::{KeyboardEvent, PointerEvent};
+use input_event::EventKind;
 use lan_mouse_proto::ProtoEvent;
 
 #[cfg(feature = "metrics")]
@@ -12,6 +12,10 @@ use std::{
 
 #[cfg(feature = "metrics")]
 const SAMPLE_CAPACITY: usize = 4096;
+
+/// how often collected metrics are written to the log
+#[cfg(feature = "metrics")]
+const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Timestamp {
@@ -28,28 +32,6 @@ impl Timestamp {
     }
 }
 
-#[cfg(feature = "metrics")]
-#[derive(Clone, Copy, Debug)]
-enum EventKind {
-    Motion,
-    Button,
-    Scroll,
-    Key,
-    Modifiers,
-}
-
-#[cfg(feature = "metrics")]
-fn event_kind(event: &Event) -> EventKind {
-    match event {
-        Event::Pointer(PointerEvent::Motion { .. }) => EventKind::Motion,
-        Event::Pointer(PointerEvent::Button { .. }) => EventKind::Button,
-        Event::Pointer(PointerEvent::Axis { .. })
-        | Event::Pointer(PointerEvent::AxisDiscrete120 { .. }) => EventKind::Scroll,
-        Event::Keyboard(KeyboardEvent::Key { .. }) => EventKind::Key,
-        Event::Keyboard(KeyboardEvent::Modifiers { .. }) => EventKind::Modifiers,
-    }
-}
-
 pub(crate) fn record_serialization(_started_at: Timestamp) {
     #[cfg(feature = "metrics")]
     with_metrics(|metrics| metrics.serialization.observe(_started_at.instant.elapsed()));
@@ -58,14 +40,14 @@ pub(crate) fn record_serialization(_started_at: Timestamp) {
 pub(crate) fn record_sent(_event: &ProtoEvent) {
     #[cfg(feature = "metrics")]
     if let ProtoEvent::Input(event) = _event {
-        with_metrics(|metrics| metrics.sent.record(event_kind(event)));
+        with_metrics(|metrics| metrics.sent.record(EventKind::of(event)));
     }
 }
 
 pub(crate) fn record_received(_event: &ProtoEvent) {
     #[cfg(feature = "metrics")]
     if let ProtoEvent::Input(event) = _event {
-        with_metrics(|metrics| metrics.received.record(event_kind(event)));
+        with_metrics(|metrics| metrics.received.record(EventKind::of(event)));
     }
 }
 
@@ -116,7 +98,11 @@ pub(crate) fn injection_queue_pop() {
 
 pub(crate) fn record_emulation_inactive_drop(_event: &Event) {
     #[cfg(feature = "metrics")]
-    with_metrics(|metrics| metrics.emulation_inactive_drops.record(event_kind(_event)));
+    with_metrics(|metrics| {
+        metrics
+            .emulation_inactive_drops
+            .record(EventKind::of(_event))
+    });
 }
 
 pub(crate) fn start_reporter() {
@@ -124,7 +110,7 @@ pub(crate) fn start_reporter() {
     {
         with_metrics(|_| {});
         tokio::task::spawn_local(async {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            let mut interval = tokio::time::interval(REPORT_INTERVAL);
             interval.tick().await;
             loop {
                 interval.tick().await;
@@ -157,8 +143,7 @@ fn report() {
             "window_s={elapsed:.1} sent_eps={:.1} received_eps={:.1} \
              rtt_us={} serialization_us={} capture_dispatch_to_send_us={} \
              receive_to_inject_us={} switch_ack_us={} injection_queue_current={} \
-             injection_queue_max={} motion_merged=0 emulation_inactive_drops={} \
-             ordering=unavailable_without_sequence",
+             injection_queue_max={} emulation_inactive_drops={}",
             sent as f64 / elapsed,
             received as f64 / elapsed,
             metrics.rtt.summary(),

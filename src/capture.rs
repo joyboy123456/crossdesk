@@ -17,7 +17,13 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     connect::Connection,
     observability::{self, Timestamp},
+    position::{capture_to_proto, ipc_to_capture},
+    task::DropGuard,
 };
+
+/// minimum time between two "releasing capture" warnings, so a peer that is
+/// down does not flood the log with one line per captured input event
+const RELEASE_LOG_DEBOUNCE: Duration = Duration::from_millis(500);
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -124,7 +130,7 @@ impl Capture {
         pos: lan_mouse_ipc::Position,
         capture_type: CaptureType,
     ) {
-        let pos = to_capture_pos(pos);
+        let pos = ipc_to_capture(pos);
         self.request_tx
             .send(CaptureRequest::Create(handle, pos, capture_type))
             .expect("channel closed");
@@ -408,7 +414,7 @@ impl CaptureTask {
                 .expect("channel closed");
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        let opposite_pos = capture_to_proto(self.get_pos(handle).opposite());
 
         let event = match event {
             CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
@@ -426,8 +432,11 @@ impl CaptureTask {
                 }
             }
             Err(e) => {
-                const DUR: Duration = Duration::from_millis(500);
-                debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+                debounce!(
+                    PREV_LOG,
+                    RELEASE_LOG_DEBOUNCE,
+                    log::warn!("releasing capture: {e}")
+                );
                 self.switch_started_at = None;
                 capture.release().await?;
             }
@@ -501,43 +510,4 @@ enum State {
     #[default]
     WaitingForAck,
     Sending,
-}
-
-fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
-    match pos {
-        lan_mouse_ipc::Position::Left => input_capture::Position::Left,
-        lan_mouse_ipc::Position::Right => input_capture::Position::Right,
-        lan_mouse_ipc::Position::Top => input_capture::Position::Top,
-        lan_mouse_ipc::Position::Bottom => input_capture::Position::Bottom,
-    }
-}
-
-fn to_proto_pos(pos: input_capture::Position) -> lan_mouse_proto::Position {
-    match pos {
-        input_capture::Position::Left => lan_mouse_proto::Position::Left,
-        input_capture::Position::Right => lan_mouse_proto::Position::Right,
-        input_capture::Position::Top => lan_mouse_proto::Position::Top,
-        input_capture::Position::Bottom => lan_mouse_proto::Position::Bottom,
-    }
-}
-
-struct DropGuard<T> {
-    tx: Sender<T>,
-    on_drop: Option<T>,
-}
-
-impl<T> DropGuard<T> {
-    fn new(tx: Sender<T>, on_new: T, on_drop: T) -> Self {
-        tx.send(on_new).expect("channel closed");
-        let on_drop = Some(on_drop);
-        Self { tx, on_drop }
-    }
-}
-
-impl<T> Drop for DropGuard<T> {
-    fn drop(&mut self) {
-        self.tx
-            .send(self.on_drop.take().expect("item"))
-            .expect("channel closed");
-    }
 }

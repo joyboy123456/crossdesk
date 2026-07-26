@@ -45,7 +45,7 @@ pub enum ProtocolError {
 }
 
 /// Position of a client
-#[derive(Clone, Copy, Debug, TryFromPrimitive, IntoPrimitive)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
 pub enum Position {
     Left,

@@ -2,6 +2,7 @@ use crate::{
     client::ClientManager,
     config::local_commit,
     observability::{self, Timestamp},
+    peer::PeerCapabilities,
 };
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{
@@ -54,6 +55,13 @@ pub(crate) enum ConnectionError {
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// number of pings sent per liveness round; at least one must be answered
+/// before the round ends or the connection is closed
+const PINGS_PER_ROUND: usize = 4;
+
+/// delay between two pings of the same round
+const PING_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 struct PingState {
@@ -141,22 +149,40 @@ async fn connect_any(
 
 pub(crate) struct Connection {
     cert: Certificate,
-    client_manager: ClientManager,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     recv_rx: Receiver<(ClientHandle, WireEvent)>,
-    recv_tx: Sender<(ClientHandle, WireEvent)>,
-    ping_state: Rc<RefCell<PingState>>,
-    peer_capabilities: Rc<RefCell<HashMap<SocketAddr, u32>>>,
+    ctx: ConnectionContext,
 }
 
+/// State shared between [`Connection`] and the per-connection tasks it spawns.
 #[derive(Clone)]
 struct ConnectionContext {
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     recv_tx: Sender<(ClientHandle, WireEvent)>,
     ping_state: Rc<RefCell<PingState>>,
-    peer_capabilities: Rc<RefCell<HashMap<SocketAddr, u32>>>,
+    peer_capabilities: PeerCapabilities,
+}
+
+impl ConnectionContext {
+    /// look up the open connection to `addr`, if any
+    async fn conn(&self, addr: SocketAddr) -> Option<Arc<dyn Conn + Send + Sync>> {
+        self.conns.lock().await.get(&addr).cloned()
+    }
+
+    /// forget the connection to `addr` and everything we learned about it
+    async fn disconnect(&self, handle: ClientHandle, addr: SocketAddr) {
+        log::warn!("client ({handle}) @ {addr} connection closed");
+        let active: Vec<SocketAddr> = {
+            let mut conns = self.conns.lock().await;
+            conns.remove(&addr);
+            conns.keys().copied().collect()
+        };
+        self.client_manager.set_active_addr(handle, None);
+        self.client_manager.set_peer_commit(handle, None);
+        self.peer_capabilities.remove(addr);
+        log::info!("active connections: {active:?}");
+    }
 }
 
 impl Connection {
@@ -164,13 +190,15 @@ impl Connection {
         let (recv_tx, recv_rx) = channel();
         Self {
             cert,
-            client_manager,
-            conns: Default::default(),
             connecting: Default::default(),
             recv_rx,
-            recv_tx,
-            ping_state: Default::default(),
-            peer_capabilities: Default::default(),
+            ctx: ConnectionContext {
+                client_manager,
+                conns: Default::default(),
+                recv_tx,
+                ping_state: Default::default(),
+                peer_capabilities: Default::default(),
+            },
         }
     }
 
@@ -187,27 +215,16 @@ impl Connection {
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         observability::record_serialization(serialization_started);
         let buf = &buf[..len];
-        if let Some(addr) = self.client_manager.active_addr(handle) {
-            let conn = {
-                let conns = self.conns.lock().await;
-                conns.get(&addr).cloned()
-            };
-            if let Some(conn) = conn {
-                if !self.client_manager.alive(handle) {
+        if let Some(addr) = self.ctx.client_manager.active_addr(handle) {
+            if let Some(conn) = self.ctx.conn(addr).await {
+                if !self.ctx.client_manager.alive(handle) {
                     return Err(ConnectionError::TargetEmulationDisabled);
                 }
                 match conn.send(buf).await {
                     Ok(_) => observability::record_sent(&event),
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(
-                            &self.client_manager,
-                            handle,
-                            addr,
-                            &self.conns,
-                            &self.peer_capabilities,
-                        )
-                        .await;
+                        self.ctx.disconnect(handle, addr).await;
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -224,13 +241,7 @@ impl Connection {
                 self.cert.clone(),
                 handle,
                 self.connecting.clone(),
-                ConnectionContext {
-                    client_manager: self.client_manager.clone(),
-                    conns: self.conns.clone(),
-                    recv_tx: self.recv_tx.clone(),
-                    ping_state: self.ping_state.clone(),
-                    peer_capabilities: self.peer_capabilities.clone(),
-                },
+                self.ctx.clone(),
             ));
         }
         Err(ConnectionError::NotConnected)
@@ -241,33 +252,25 @@ impl Connection {
         text: &str,
         handle: ClientHandle,
     ) -> Result<(), ConnectionError> {
-        let Some(addr) = self.client_manager.active_addr(handle) else {
+        let Some(addr) = self.ctx.client_manager.active_addr(handle) else {
             return Err(ConnectionError::NotConnected);
         };
-        if self
+        if !self
+            .ctx
             .peer_capabilities
-            .borrow()
-            .get(&addr)
-            .is_none_or(|capabilities| capabilities & CAPABILITY_CLIPBOARD_TEXT == 0)
+            .supports(addr, CAPABILITY_CLIPBOARD_TEXT)
         {
             return Err(ConnectionError::ClipboardUnsupported);
         }
-        let conn = {
-            let conns = self.conns.lock().await;
-            conns.get(&addr).cloned()
-        }
-        .ok_or(ConnectionError::NotConnected)?;
+        let conn = self
+            .ctx
+            .conn(addr)
+            .await
+            .ok_or(ConnectionError::NotConnected)?;
         let packet = encode_clipboard_text(text)?;
         if let Err(error) = conn.send(&packet).await {
             log::warn!("client {handle} failed to send clipboard text: {error}");
-            disconnect(
-                &self.client_manager,
-                handle,
-                addr,
-                &self.conns,
-                &self.peer_capabilities,
-            )
-            .await;
+            self.ctx.disconnect(handle, addr).await;
             return Err(error.into());
         }
         log::debug!("sent clipboard text to {addr} ({} bytes)", text.len());
@@ -282,32 +285,25 @@ impl Connection {
                 return;
             }
         };
-        let capable = self.peer_capabilities.borrow().clone();
         let conns = {
-            let conns = self.conns.lock().await;
+            let conns = self.ctx.conns.lock().await;
             conns
                 .iter()
                 .map(|(addr, conn)| (*addr, conn.clone()))
                 .collect::<Vec<_>>()
         };
         for (addr, conn) in conns {
-            if !capable
-                .get(&addr)
-                .is_some_and(|capabilities| capabilities & CAPABILITY_CLIPBOARD_TEXT != 0)
+            if !self
+                .ctx
+                .peer_capabilities
+                .supports(addr, CAPABILITY_CLIPBOARD_TEXT)
             {
                 continue;
             }
             if let Err(error) = conn.send(&packet).await {
                 log::warn!("failed to send clipboard text to {addr}: {error}");
-                if let Some(handle) = self.client_manager.get_client(addr) {
-                    disconnect(
-                        &self.client_manager,
-                        handle,
-                        addr,
-                        &self.conns,
-                        &self.peer_capabilities,
-                    )
-                    .await;
+                if let Some(handle) = self.ctx.client_manager.get_client(addr) {
+                    self.ctx.disconnect(handle, addr).await;
                 }
             }
         }
@@ -378,8 +374,8 @@ async fn ping_pong(
     loop {
         let (buf, len) = ProtoEvent::Ping.into();
 
-        // send 4 pings, at least one must be answered
-        for _ in 0..4 {
+        // at least one ping of the round must be answered
+        for _ in 0..PINGS_PER_ROUND {
             if let Err(e) = conn.send(&buf[..len]).await {
                 log::warn!("{addr}: send error `{e}`, closing connection");
                 let _ = conn.close().await;
@@ -388,7 +384,7 @@ async fn ping_pong(
             ping_state.borrow_mut().sent(addr);
             log::trace!("PING >->->->->- {addr}");
 
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(PING_INTERVAL).await;
         }
 
         if !ping_state.borrow_mut().take_response(addr) {
@@ -421,10 +417,7 @@ async fn receive_loop(
                         capabilities,
                     } => {
                         context.client_manager.set_peer_commit(handle, Some(commit));
-                        context
-                            .peer_capabilities
-                            .borrow_mut()
-                            .insert(addr, capabilities);
+                        context.peer_capabilities.set(addr, capabilities);
                     }
                     event => context
                         .recv_tx
@@ -444,28 +437,5 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    disconnect(
-        &context.client_manager,
-        handle,
-        addr,
-        &context.conns,
-        &context.peer_capabilities,
-    )
-    .await;
-}
-
-async fn disconnect(
-    client_manager: &ClientManager,
-    handle: ClientHandle,
-    addr: SocketAddr,
-    conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
-    peer_capabilities: &RefCell<HashMap<SocketAddr, u32>>,
-) {
-    log::warn!("client ({handle}) @ {addr} connection closed");
-    conns.lock().await.remove(&addr);
-    client_manager.set_active_addr(handle, None);
-    client_manager.set_peer_commit(handle, None);
-    peer_capabilities.borrow_mut().remove(&addr);
-    let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
-    log::info!("active connections: {active:?}");
+    context.disconnect(handle, addr).await;
 }

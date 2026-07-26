@@ -46,6 +46,30 @@ pub enum Event {
     Keyboard(KeyboardEvent),
 }
 
+/// Coarse classification of an [`Event`], used to break metrics counters
+/// down by event category without retaining any event payload.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum EventKind {
+    Motion,
+    Button,
+    Scroll,
+    Key,
+    Modifiers,
+}
+
+impl EventKind {
+    pub fn of(event: &Event) -> Self {
+        match event {
+            Event::Pointer(PointerEvent::Motion { .. }) => Self::Motion,
+            Event::Pointer(PointerEvent::Button { .. }) => Self::Button,
+            Event::Pointer(PointerEvent::Axis { .. })
+            | Event::Pointer(PointerEvent::AxisDiscrete120 { .. }) => Self::Scroll,
+            Event::Keyboard(KeyboardEvent::Key { .. }) => Self::Key,
+            Event::Keyboard(KeyboardEvent::Modifiers { .. }) => Self::Modifiers,
+        }
+    }
+}
+
 impl Display for PointerEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

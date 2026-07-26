@@ -1,5 +1,5 @@
 use crate::CaptureEvent;
-use input_event::{Event, KeyboardEvent, PointerEvent};
+use input_event::EventKind;
 use std::{
     sync::{
         OnceLock,
@@ -10,40 +10,29 @@ use std::{
 
 const REPORT_INTERVAL_SECONDS: u64 = 5;
 
+/// Metrics classification of a [`CaptureEvent`]: either the session-start
+/// marker, or one of the shared [`EventKind`] categories.
 #[derive(Clone, Copy)]
-pub(crate) enum EventKind {
+pub(crate) enum CaptureEventKind {
     Begin,
-    Motion,
-    Button,
-    Scroll,
-    Key,
-    Modifiers,
+    Input(EventKind),
 }
 
-pub(crate) fn event_kind(event: &CaptureEvent) -> EventKind {
+pub(crate) fn event_kind(event: &CaptureEvent) -> CaptureEventKind {
     match event {
-        CaptureEvent::Begin => EventKind::Begin,
-        CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { .. })) => EventKind::Motion,
-        CaptureEvent::Input(Event::Pointer(PointerEvent::Button { .. })) => EventKind::Button,
-        CaptureEvent::Input(Event::Pointer(PointerEvent::Axis { .. }))
-        | CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 { .. })) => {
-            EventKind::Scroll
-        }
-        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { .. })) => EventKind::Key,
-        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers { .. })) => {
-            EventKind::Modifiers
-        }
+        CaptureEvent::Begin => CaptureEventKind::Begin,
+        CaptureEvent::Input(event) => CaptureEventKind::Input(EventKind::of(event)),
     }
 }
 
-pub(crate) fn record_enqueued(queue: &'static str, kind: EventKind, current_depth: usize) {
+pub(crate) fn record_enqueued(queue: &'static str, kind: CaptureEventKind, current_depth: usize) {
     ENQUEUED.record(kind);
     update_depth(current_depth);
     report_if_due(queue);
 }
 
 #[cfg(windows)]
-pub(crate) fn record_full_drop(queue: &'static str, kind: EventKind, capacity: usize) {
+pub(crate) fn record_full_drop(queue: &'static str, kind: CaptureEventKind, capacity: usize) {
     FULL_DROPS.record(kind);
     update_depth(capacity);
     report_if_due(queue);
@@ -93,7 +82,7 @@ fn report_if_due(queue: &'static str) {
     log::info!(
         target: "crossdesk::metrics",
         "capture_queue={} window_s={:.1} queue_current={} queue_max={} \
-         enqueued={} full_drops={} motion_merged=0",
+         enqueued={} full_drops={}",
         queue,
         elapsed_ms.saturating_sub(last_report_ms) as f64 / 1000.0,
         queue_current,
@@ -124,14 +113,14 @@ impl AtomicEventCounts {
         }
     }
 
-    fn record(&self, kind: EventKind) {
+    fn record(&self, kind: CaptureEventKind) {
         let counter = match kind {
-            EventKind::Begin => &self.begin,
-            EventKind::Motion => &self.motion,
-            EventKind::Button => &self.button,
-            EventKind::Scroll => &self.scroll,
-            EventKind::Key => &self.key,
-            EventKind::Modifiers => &self.modifiers,
+            CaptureEventKind::Begin => &self.begin,
+            CaptureEventKind::Input(EventKind::Motion) => &self.motion,
+            CaptureEventKind::Input(EventKind::Button) => &self.button,
+            CaptureEventKind::Input(EventKind::Scroll) => &self.scroll,
+            CaptureEventKind::Input(EventKind::Key) => &self.key,
+            CaptureEventKind::Input(EventKind::Modifiers) => &self.modifiers,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }

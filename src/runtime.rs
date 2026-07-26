@@ -19,8 +19,18 @@ use std::{
 use thiserror::Error;
 use tokio::task::LocalSet;
 
+/// how long the GUI waits for a service it started to exit on its own before
+/// killing it
 #[cfg(feature = "gui")]
 const SERVICE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// how long to wait for the IPC socket when probing for a running service
+#[cfg(feature = "gui")]
+const SERVICE_PROBE_TIMEOUT: Duration = Duration::from_millis(75);
+
+/// polling interval while waiting for the owned service to exit
+#[cfg(feature = "gui")]
+const SERVICE_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Error)]
 pub enum CrossDeskError {
@@ -59,16 +69,25 @@ pub fn run() -> Result<(), CrossDeskError> {
         Some(Command::TestEmulation(args)) => run_async(emulation_test::run(config, args))?,
         Some(Command::TestCapture(args)) => run_async(capture_test::run(config, args))?,
         Some(Command::Cli(args)) => run_async(lan_mouse_cli::run(args))?,
-        Some(Command::Daemon) => match run_async(run_service(config)) {
-            Err(CrossDeskError::Service(ServiceError::IpcListen(
-                IpcListenerCreationError::AlreadyRunning,
-            ))) => log::info!("service already running"),
-            result => result?,
-        },
+        Some(Command::Daemon) => run_daemon(config)?,
         None => run_default(config)?,
     }
 
     Ok(())
+}
+
+/// Run the service in this process. A service that is already running is not
+/// an error: the daemon simply hands over to the existing one.
+fn run_daemon(config: Config) -> Result<(), CrossDeskError> {
+    match run_async(run_service(config)) {
+        Err(CrossDeskError::Service(ServiceError::IpcListen(
+            IpcListenerCreationError::AlreadyRunning,
+        ))) => {
+            log::info!("service already running");
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 #[cfg(feature = "gui")]
@@ -86,13 +105,7 @@ fn run_default(_config: Config) -> Result<(), CrossDeskError> {
 
 #[cfg(not(feature = "gui"))]
 fn run_default(config: Config) -> Result<(), CrossDeskError> {
-    match run_async(run_service(config)) {
-        Err(CrossDeskError::Service(ServiceError::IpcListen(
-            IpcListenerCreationError::AlreadyRunning,
-        ))) => log::info!("service already running"),
-        result => result?,
-    }
-    Ok(())
+    run_daemon(config)
 }
 
 fn run_async<F, E>(future: F) -> Result<(), CrossDeskError>
@@ -131,9 +144,7 @@ fn service_is_running() -> bool {
         return false;
     };
     runtime
-        .block_on(lan_mouse_ipc::connect_async(Some(Duration::from_millis(
-            75,
-        ))))
+        .block_on(lan_mouse_ipc::connect_async(Some(SERVICE_PROBE_TIMEOUT)))
         .is_ok()
 }
 
@@ -150,7 +161,7 @@ fn finish_owned_service(child: &mut Child) -> Result<(), io::Error> {
             child.wait()?;
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(SERVICE_SHUTDOWN_POLL_INTERVAL);
     }
 }
 

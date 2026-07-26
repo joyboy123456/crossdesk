@@ -6,9 +6,8 @@ use lan_mouse_proto::{
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
-    cell::RefCell,
     collections::{HashMap, VecDeque},
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     rc::Rc,
     sync::{Arc, Mutex, RwLock},
     time::Duration,
@@ -29,7 +28,16 @@ use webrtc_util::{Conn, Error, conn::Listener};
 use crate::{
     crypto,
     observability::{self, Timestamp},
+    peer::PeerCapabilities,
 };
+
+/// How long `accept()` may be awaited before the select loop goes around
+/// again. Works around <https://github.com/webrtc-rs/webrtc/issues/614>,
+/// where a pending `accept()` future starves the other select branches.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// address the DTLS listener binds to
+const LISTEN_IP: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
 
 #[derive(Error, Debug)]
 pub enum ListenerCreationError {
@@ -63,7 +71,7 @@ pub(crate) struct DtlsListener {
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
-    peer_capabilities: Rc<RefCell<HashMap<SocketAddr, u32>>>,
+    peer_capabilities: PeerCapabilities,
 }
 
 type VerifyPeerCertificateFn = Arc<
@@ -118,12 +126,12 @@ impl DtlsListener {
             ..Default::default()
         };
 
-        let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
+        let listen_addr = SocketAddr::from((LISTEN_IP, port));
         let mut listener = listen(listen_addr, cfg.clone()).await?;
 
         let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
             Rc::new(AsyncMutex::new(Vec::new()));
-        let peer_capabilities: Rc<RefCell<HashMap<SocketAddr, u32>>> = Default::default();
+        let peer_capabilities = PeerCapabilities::default();
 
         let conns_clone = conns.clone();
         let peer_capabilities_clone = peer_capabilities.clone();
@@ -132,9 +140,8 @@ impl DtlsListener {
             let connection_attempts = connection_attempts.clone();
             spawn_local(async move {
                 loop {
-                    let sleep = tokio::time::sleep(Duration::from_secs(2));
+                    let sleep = tokio::time::sleep(ACCEPT_POLL_INTERVAL);
                     tokio::select! {
-                        /* workaround for https://github.com/webrtc-rs/webrtc/issues/614 */
                         _ = sleep => continue,
                         c = listener.accept() => match c {
                             Ok((conn, addr)) => {
@@ -175,7 +182,7 @@ impl DtlsListener {
                         },
                         port = request_port_change_rx.recv() => {
                             let port = port.expect("channel closed");
-                            let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
+                            let listen_addr = SocketAddr::from((LISTEN_IP, port));
                             match listen(listen_addr, cfg.clone()).await {
                                 Ok(new_listener) => {
                                     let _ = listener.close().await;
@@ -233,17 +240,13 @@ impl DtlsListener {
     }
 
     pub(crate) fn set_peer_capabilities(&self, addr: SocketAddr, capabilities: u32) {
-        self.peer_capabilities
-            .borrow_mut()
-            .insert(addr, capabilities);
+        self.peer_capabilities.set(addr, capabilities);
     }
 
     pub(crate) async fn send_clipboard(&self, addr: SocketAddr, text: &str) {
-        if self
+        if !self
             .peer_capabilities
-            .borrow()
-            .get(&addr)
-            .is_none_or(|capabilities| capabilities & CAPABILITY_CLIPBOARD_TEXT == 0)
+            .supports(addr, CAPABILITY_CLIPBOARD_TEXT)
         {
             return;
         }
@@ -270,12 +273,11 @@ impl DtlsListener {
                 return;
             }
         };
-        let capable = self.peer_capabilities.borrow().clone();
         let conns = self.conns.lock().await;
         for (addr, conn) in conns.iter() {
-            if capable
-                .get(addr)
-                .is_some_and(|capabilities| capabilities & CAPABILITY_CLIPBOARD_TEXT != 0)
+            if self
+                .peer_capabilities
+                .supports(*addr, CAPABILITY_CLIPBOARD_TEXT)
             {
                 if let Err(error) = conn.send(&packet).await {
                     log::warn!("failed to send clipboard text to {addr}: {error}");
@@ -320,7 +322,7 @@ async fn read_loop(
     addr: SocketAddr,
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
-    peer_capabilities: Rc<RefCell<HashMap<SocketAddr, u32>>>,
+    peer_capabilities: PeerCapabilities,
 ) -> Result<(), Error> {
     let mut b = vec![0u8; MAX_WIRE_SIZE];
 
@@ -354,7 +356,7 @@ async fn read_loop(
         }
     }
     log::info!("dtls client disconnected {addr:?}");
-    peer_capabilities.borrow_mut().remove(&addr);
+    peer_capabilities.remove(addr);
     let mut conns = conns.lock().await;
     let index = conns
         .iter()
