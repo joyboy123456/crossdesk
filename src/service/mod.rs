@@ -1,5 +1,10 @@
+mod clipboard_state;
+mod hooks;
+mod incoming;
+mod keys;
+
 use crate::{
-    capture::{Capture, CaptureType, ICaptureEvent},
+    capture::{Capture, CaptureTarget, CaptureType, ICaptureEvent},
     client::ClientManager,
     clipboard::{ClipboardEvent, ClipboardSync},
     config::{Config, ConfigClient},
@@ -10,20 +15,21 @@ use crate::{
     listen::{DtlsListener, ListenerCreationError},
     task::{Receiver, Sender, channel, send},
 };
+use clipboard_state::{ClipboardAction, ClipboardState};
 use futures::StreamExt;
+use incoming::{IncomingTracker, Registration};
+use keys::AuthorizedKeys;
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
     IpcListenerCreationError, Position, Status,
 };
-use lan_mouse_proto::MAX_CLIPBOARD_TEXT_SIZE;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, PoisonError, RwLock},
 };
 use thiserror::Error;
-use tokio::{process::Command, signal};
+use tokio::signal;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -37,6 +43,14 @@ pub enum ServiceError {
     Certificate(#[from] crypto::Error),
 }
 
+/// The daemon: owns every subsystem and routes events between them.
+///
+/// The fields fall into three groups - the handles that drive the subsystems,
+/// the state describing what is configured and connected, and the frontend
+/// event queue. Each piece of state that has rules of its own lives in a
+/// submodule ([`incoming`], [`clipboard_state`], [`keys`]) so those rules can
+/// be tested without a running service; what stays here is the event loop and
+/// the routing.
 pub struct Service {
     /// configuration
     config: Config,
@@ -46,57 +60,32 @@ pub struct Service {
     emulation: Emulation,
     /// dns resolver
     resolver: DnsResolver,
+    /// clipboard synchronization worker
+    clipboard: ClipboardSync,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
-    /// authorized public key sha256 fingerprints
-    authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+    /// frontend events queued for sending
+    frontend_events_tx: Sender<FrontendEvent>,
+    frontend_events_rx: Receiver<FrontendEvent>,
+
     /// (outgoing) client information
     client_manager: ClientManager,
+    /// peers that connected to this device
+    incoming: IncomingTracker,
+    /// fingerprints allowed to connect
+    authorized_keys: AuthorizedKeys,
+    /// clipboard synchronization state and loop suppression
+    clipboard_state: ClipboardState,
+
     /// current port
     port: u16,
     /// the public key fingerprint for (D)TLS
     public_key_fingerprint: String,
-    /// frontend events queued for sending
-    frontend_events_tx: Sender<FrontendEvent>,
-    frontend_events_rx: Receiver<FrontendEvent>,
     /// status of input capture (enabled / disabled)
     capture_status: Status,
     /// status of input emulation (enabled / disabled)
     emulation_status: Status,
-    /// keep track of registered connections to avoid duplicate barriers
-    incoming_conns: HashSet<SocketAddr>,
-    /// map from capture handle to connection info
-    incoming_conn_info: HashMap<ClientHandle, Incoming>,
-    next_trigger_handle: u64,
     shutdown_requested: bool,
-    clipboard: ClipboardSync,
-    clipboard_enabled: bool,
-    clipboard_available: bool,
-    clipboard_text: Option<String>,
-}
-
-#[derive(Debug)]
-struct Incoming {
-    fingerprint: String,
-    addr: SocketAddr,
-    pos: Position,
-}
-
-/// Build the command that runs a user-configured enter hook through the
-/// platform's shell, so hooks can use pipes, quoting and built-ins.
-fn shell_command(cmd: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let mut command = Command::new("cmd");
-        command.arg("/C").arg(cmd);
-        command
-    }
-    #[cfg(not(windows))]
-    {
-        let mut command = Command::new("sh");
-        command.arg("-c").arg(cmd);
-        command
-    }
 }
 
 impl Service {
@@ -113,10 +102,10 @@ impl Service {
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
 
-        let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
+        let authorized_keys = AuthorizedKeys::new(config.authorized_fingerprints());
         // listener + connection
         let listener =
-            DtlsListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
+            DtlsListener::new(config.port(), cert.clone(), authorized_keys.shared()).await?;
         let conn = Connection::new(cert.clone(), client_manager.clone());
 
         // input capture + emulation
@@ -146,14 +135,10 @@ impl Service {
             port,
             capture_status: Default::default(),
             emulation_status: Default::default(),
-            incoming_conn_info: Default::default(),
-            incoming_conns: Default::default(),
-            next_trigger_handle: 0,
+            incoming: Default::default(),
             shutdown_requested: false,
             clipboard,
-            clipboard_enabled,
-            clipboard_available: false,
-            clipboard_text: None,
+            clipboard_state: ClipboardState::new(clipboard_enabled),
         };
         Ok(service)
     }
@@ -306,12 +291,8 @@ impl Service {
             })
             .collect();
         self.config.set_clients(clients);
-        let authorized_keys = self
-            .authorized_keys
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        self.config.set_authorized_keys(authorized_keys);
+        self.config
+            .set_authorized_keys(self.authorized_keys.snapshot());
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
         }
@@ -335,11 +316,8 @@ impl Service {
         }
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
-        let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone_from(&authorized_keys);
+            .replace(&self.config.authorized_fingerprints());
         self.set_clipboard_enabled(self.config.clipboard_sync());
         self.sync_frontend();
     }
@@ -353,21 +331,10 @@ impl Service {
                 addr,
                 pos,
                 fingerprint,
-            } => {
-                // check if already registered
-                if !self.incoming_conns.contains(&addr) {
-                    self.add_incoming(addr, pos, fingerprint.clone());
-                    self.notify_frontend(FrontendEvent::DeviceEntered {
-                        fingerprint,
-                        addr,
-                        pos,
-                    });
-                } else {
-                    self.update_incoming(addr, pos, fingerprint);
-                }
-            }
+            } => self.register_incoming(addr, pos, fingerprint),
             EmulationEvent::Disconnected { addr } => {
-                if let Some(addr) = self.remove_incoming(addr) {
+                if let Some(target) = self.incoming.remove(addr) {
+                    self.capture.destroy(target);
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
             }
@@ -406,13 +373,39 @@ impl Service {
         }
     }
 
+    /// A peer announced which screen edge it sits at. Register it, and carry
+    /// out whatever capture work that implies.
+    fn register_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
+        match self.incoming.register(addr, pos, fingerprint.clone()) {
+            Registration::Unchanged => {}
+            Registration::Added(target) => {
+                self.capture.create(target, pos, CaptureType::EnterOnly);
+                self.notify_frontend(FrontendEvent::DeviceEntered {
+                    fingerprint,
+                    addr,
+                    pos,
+                });
+            }
+            Registration::Replaced { destroy, create } => {
+                self.capture.destroy(destroy);
+                self.capture.create(create, pos, CaptureType::EnterOnly);
+                self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
+                self.notify_frontend(FrontendEvent::DeviceEntered {
+                    fingerprint,
+                    addr,
+                    pos,
+                });
+            }
+        }
+    }
+
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
-            ICaptureEvent::CaptureBegin(handle) => {
+            ICaptureEvent::CaptureBegin(target) => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
-                if let Some(incoming) = self.incoming_conn_info.get(&handle) {
-                    self.emulation.send_leave_event(incoming.addr);
+                if let Some(addr) = self.incoming.addr_of(target) {
+                    self.emulation.send_leave_event(addr);
                 }
             }
             ICaptureEvent::CaptureDisabled => {
@@ -425,7 +418,9 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
-                self.spawn_hook_command(handle);
+                if let Some(cmd) = self.client_manager.get_enter_cmd(handle) {
+                    hooks::spawn(cmd);
+                }
             }
             ICaptureEvent::ClipboardText(text) => self.apply_remote_clipboard(text),
         }
@@ -465,82 +460,8 @@ impl Service {
             self.public_key_fingerprint.clone(),
         ));
         self.notify_clipboard_state();
-        let keys = self
-            .authorized_keys
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        let keys = self.authorized_keys.snapshot();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
-    }
-
-    const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
-
-    fn add_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
-        let handle = Self::ENTER_HANDLE_BEGIN + self.next_trigger_handle;
-        self.next_trigger_handle += 1;
-        self.capture.create(handle, pos, CaptureType::EnterOnly);
-        self.incoming_conns.insert(addr);
-        self.incoming_conn_info.insert(
-            handle,
-            Incoming {
-                fingerprint,
-                addr,
-                pos,
-            },
-        );
-    }
-
-    fn update_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
-        let Some(incoming) = self
-            .incoming_conn_info
-            .values_mut()
-            .find(|i| i.addr == addr)
-        else {
-            // `incoming_conns` says we know this address but no capture is
-            // registered for it, so the two tables have drifted apart.
-            // Re-register the connection rather than take down the service.
-            log::warn!("no capture registered for {addr}; registering it again");
-            self.incoming_conns.remove(&addr);
-            self.add_incoming(addr, pos, fingerprint.clone());
-            self.notify_frontend(FrontendEvent::DeviceEntered {
-                fingerprint,
-                addr,
-                pos,
-            });
-            return;
-        };
-        let mut changed = false;
-        if incoming.fingerprint != fingerprint {
-            incoming.fingerprint = fingerprint.clone();
-            changed = true;
-        }
-        if incoming.pos != pos {
-            incoming.pos = pos;
-            changed = true;
-        }
-        if changed {
-            self.remove_incoming(addr);
-            self.add_incoming(addr, pos, fingerprint.clone());
-            self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
-            self.notify_frontend(FrontendEvent::DeviceEntered {
-                fingerprint,
-                addr,
-                pos,
-            });
-        }
-    }
-
-    fn remove_incoming(&mut self, addr: SocketAddr) -> Option<SocketAddr> {
-        let handle = self
-            .incoming_conn_info
-            .iter()
-            .find(|(_, incoming)| incoming.addr == addr)
-            .map(|(k, _)| *k)?;
-        self.capture.destroy(handle);
-        self.incoming_conns.remove(&addr);
-        self.incoming_conn_info
-            .remove(&handle)
-            .map(|incoming| incoming.addr)
     }
 
     fn notify_frontend(&mut self, event: FrontendEvent) {
@@ -548,28 +469,14 @@ impl Service {
     }
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {
-        self.authorized_keys
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(fp, desc);
-        let keys = self
-            .authorized_keys
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        self.authorized_keys.authorize(fp, desc);
+        let keys = self.authorized_keys.snapshot();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
-        self.authorized_keys
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&fp);
-        let keys = self
-            .authorized_keys
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        self.authorized_keys.revoke(&fp);
+        let keys = self.authorized_keys.snapshot();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
@@ -608,7 +515,7 @@ impl Service {
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
         if self.client_manager.deactivate_client(handle) {
-            self.capture.destroy(handle);
+            self.capture.destroy(CaptureTarget::Client(handle));
             self.broadcast_client(handle);
             log::info!("deactivated client {handle}");
         }
@@ -634,7 +541,8 @@ impl Service {
         /* activate the client */
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
-            self.capture.create(handle, pos, CaptureType::Default);
+            self.capture
+                .create(CaptureTarget::Client(handle), pos, CaptureType::Default);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
         }
@@ -655,7 +563,7 @@ impl Service {
             .map(|(_, s)| s.active)
             .unwrap_or(false)
         {
-            self.capture.destroy(handle);
+            self.capture.destroy(CaptureTarget::Client(handle));
         }
         self.notify_frontend(FrontendEvent::Deleted(handle));
     }
@@ -701,86 +609,51 @@ impl Service {
         self.notify_frontend(event);
     }
 
-    fn spawn_hook_command(&self, handle: ClientHandle) {
-        let Some(cmd) = self.client_manager.get_enter_cmd(handle) else {
-            return;
-        };
-        tokio::task::spawn_local(async move {
-            log::info!("spawning command!");
-            let mut child = match shell_command(&cmd).spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("could not execute cmd: {e}");
-                    return;
-                }
-            };
-            match child.wait().await {
-                Ok(s) => {
-                    if s.success() {
-                        log::info!("{cmd} exited successfully");
-                    } else {
-                        log::warn!("{cmd} exited with {s}");
-                    }
-                }
-                Err(e) => log::warn!("{cmd}: {e}"),
-            }
-        });
-    }
-
     fn handle_clipboard_event(&mut self, event: ClipboardEvent) {
         match event {
             ClipboardEvent::Availability(available) => {
-                self.clipboard_available = available;
+                self.clipboard_state.set_available(available);
                 self.notify_clipboard_state();
             }
             ClipboardEvent::LocalText(text) => {
-                if !self.clipboard_enabled {
-                    return;
-                }
-                if text.len() > MAX_CLIPBOARD_TEXT_SIZE {
-                    log::warn!(
-                        "clipboard text was not synchronized: {} bytes exceeds the {} byte limit",
-                        text.len(),
-                        MAX_CLIPBOARD_TEXT_SIZE,
-                    );
-                    self.update_clipboard_cache(None, false);
-                    return;
-                }
-                self.update_clipboard_cache(Some(text), true);
+                let action = self.clipboard_state.on_local_text(text);
+                self.apply_clipboard_action(action);
             }
         }
     }
 
     fn apply_remote_clipboard(&mut self, text: String) {
-        if !self.clipboard_enabled || self.clipboard_text.as_deref() == Some(text.as_str()) {
+        if !self.clipboard_state.accepts_remote_text(&text) {
             return;
         }
         log::debug!("applying remote clipboard text ({} bytes)", text.len());
         if self.clipboard.apply(text.clone()) {
-            self.update_clipboard_cache(Some(text), false);
+            let action = self.clipboard_state.on_remote_text_applied(text);
+            self.apply_clipboard_action(action);
         }
     }
 
     fn set_clipboard_enabled(&mut self, enabled: bool) {
-        self.clipboard_enabled = enabled;
         self.config.set_clipboard_sync(enabled);
         self.clipboard.set_enabled(enabled);
-        if !enabled {
-            self.update_clipboard_cache(None, false);
-        }
+        let action = self.clipboard_state.set_enabled(enabled);
+        self.apply_clipboard_action(action);
         self.notify_clipboard_state();
     }
 
-    fn update_clipboard_cache(&mut self, text: Option<String>, broadcast: bool) {
-        self.clipboard_text.clone_from(&text);
+    /// Push the decision [`ClipboardState`] made out to the two send paths.
+    fn apply_clipboard_action(&mut self, action: ClipboardAction) {
+        let ClipboardAction::Cache { text, broadcast } = action else {
+            return;
+        };
         self.capture.set_clipboard(text.clone(), broadcast);
         self.emulation.set_clipboard(text, broadcast);
     }
 
     fn notify_clipboard_state(&mut self) {
         self.notify_frontend(FrontendEvent::ClipboardState {
-            enabled: self.clipboard_enabled,
-            available: self.clipboard_available,
+            enabled: self.clipboard_state.enabled(),
+            available: self.clipboard_state.available(),
         });
     }
 }

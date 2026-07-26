@@ -9,6 +9,7 @@ use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
+use lan_mouse_ipc::ClientHandle;
 use lan_mouse_proto::{ProtoEvent, WireEvent};
 use tokio::task::spawn_local;
 use tokio_util::sync::CancellationToken;
@@ -30,9 +31,46 @@ pub(crate) struct Capture {
     event_rx: Receiver<ICaptureEvent>,
 }
 
+/// What a capture barrier belongs to.
+///
+/// `input-capture` identifies barriers by a bare `u64`, and both outgoing
+/// clients and incoming connections need one. They share that number space by
+/// convention: client handles (slab indices) count up from zero, triggers for
+/// incoming connections count up from the middle. This type makes the
+/// convention explicit and keeps the raw encoding in one place - the encoding
+/// itself is unchanged, so the capture backends see exactly what they did
+/// before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaptureTarget {
+    /// a configured client we send input to
+    Client(ClientHandle),
+    /// an enter-only barrier for a peer that connected to us
+    IncomingTrigger(u64),
+}
+
+/// first handle reserved for incoming connections
+const INCOMING_TRIGGER_BEGIN: u64 = u64::MAX / 2 + 1;
+
+impl CaptureTarget {
+    pub(crate) fn to_raw(self) -> CaptureHandle {
+        match self {
+            Self::Client(handle) => handle,
+            Self::IncomingTrigger(n) => INCOMING_TRIGGER_BEGIN.wrapping_add(n),
+        }
+    }
+
+    pub(crate) fn from_raw(handle: CaptureHandle) -> Self {
+        if handle >= INCOMING_TRIGGER_BEGIN {
+            Self::IncomingTrigger(handle - INCOMING_TRIGGER_BEGIN)
+        } else {
+            Self::Client(handle)
+        }
+    }
+}
+
 pub(crate) enum ICaptureEvent {
-    /// a client was entered
-    CaptureBegin(CaptureHandle),
+    /// a capture barrier was entered
+    CaptureBegin(CaptureTarget),
     /// capture disabled
     CaptureDisabled,
     /// capture disabled
@@ -43,7 +81,7 @@ pub(crate) enum ICaptureEvent {
     /// explicitly released in the meantime by
     /// either the remote client leaving its device region,
     /// a new device entering the screen or the release bind.
-    ClientEntered(u64),
+    ClientEntered(ClientHandle),
     ClipboardText(String),
 }
 
@@ -121,7 +159,7 @@ impl Capture {
 
     pub(crate) fn create(
         &self,
-        handle: CaptureHandle,
+        target: CaptureTarget,
         pos: lan_mouse_ipc::Position,
         capture_type: CaptureType,
     ) {
@@ -129,15 +167,15 @@ impl Capture {
         send(
             &self.request_tx,
             "capture create",
-            CaptureRequest::Create(handle, pos, capture_type),
+            CaptureRequest::Create(target.to_raw(), pos, capture_type),
         );
     }
 
-    pub(crate) fn destroy(&self, handle: CaptureHandle) {
+    pub(crate) fn destroy(&self, target: CaptureTarget) {
         send(
             &self.request_tx,
             "capture destroy",
-            CaptureRequest::Destroy(handle),
+            CaptureRequest::Destroy(target.to_raw()),
         );
     }
 
@@ -398,7 +436,7 @@ impl CaptureTask {
             send(
                 &self.event_tx,
                 "capture begin",
-                ICaptureEvent::CaptureBegin(handle),
+                ICaptureEvent::CaptureBegin(CaptureTarget::from_raw(handle)),
             );
         }
 
@@ -522,4 +560,38 @@ enum State {
     #[default]
     WaitingForAck,
     Sending,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The raw encoding is what reaches the capture backends, so it has to
+    /// survive refactoring unchanged.
+    #[test]
+    fn capture_targets_round_trip_through_their_raw_handle() {
+        for target in [
+            CaptureTarget::Client(0),
+            CaptureTarget::Client(1),
+            CaptureTarget::Client(INCOMING_TRIGGER_BEGIN - 1),
+            CaptureTarget::IncomingTrigger(0),
+            CaptureTarget::IncomingTrigger(1),
+            CaptureTarget::IncomingTrigger(u64::MAX - INCOMING_TRIGGER_BEGIN),
+        ] {
+            assert_eq!(CaptureTarget::from_raw(target.to_raw()), target);
+        }
+    }
+
+    #[test]
+    fn client_and_incoming_handles_do_not_collide() {
+        assert_eq!(CaptureTarget::Client(7).to_raw(), 7);
+        assert_eq!(
+            CaptureTarget::IncomingTrigger(0).to_raw(),
+            INCOMING_TRIGGER_BEGIN
+        );
+        assert_ne!(
+            CaptureTarget::Client(0).to_raw(),
+            CaptureTarget::IncomingTrigger(0).to_raw()
+        );
+    }
 }
