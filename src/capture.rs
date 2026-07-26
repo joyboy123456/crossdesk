@@ -209,20 +209,13 @@ impl CaptureTask {
             .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
     }
 
-    fn get_pos(&self, handle: CaptureHandle) -> Position {
+    /// position and type of a registered capture, or `None` if the capture was
+    /// already destroyed
+    fn get_capture(&self, handle: CaptureHandle) -> Option<(Position, CaptureType)> {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .1
-    }
-
-    fn get_type(&self, handle: CaptureHandle) -> CaptureType {
-        self.captures
-            .iter()
-            .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .2
+            .map(|&(_, pos, capture_type)| (pos, capture_type))
     }
 
     fn set_state(&mut self, state: State, reason: &'static str) {
@@ -386,6 +379,13 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
+        // The backend can still deliver events for a handle we just destroyed;
+        // there is nothing left to route them to.
+        let Some((pos, capture_type)) = self.get_capture(handle) else {
+            log::debug!("ignoring event for unregistered capture {handle}");
+            return Ok(());
+        };
+
         if event == CaptureEvent::Begin {
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
@@ -393,10 +393,10 @@ impl CaptureTask {
         }
 
         // enter only capture (for incoming connections)
-        if self.get_type(handle) == CaptureType::EnterOnly {
+        if capture_type == CaptureType::EnterOnly {
             // if there is no active outgoing connection at the current capture,
             // we release the capture
-            if !self.is_default_capture_at(self.get_pos(handle)) {
+            if !self.is_default_capture_at(pos) {
                 log::info!("releasing capture: no active client at this position");
                 capture.release().await?;
             }
@@ -414,7 +414,7 @@ impl CaptureTask {
                 .expect("channel closed");
         }
 
-        let opposite_pos = capture_to_proto(self.get_pos(handle).opposite());
+        let opposite_pos = capture_to_proto(pos.opposite());
 
         let event = match event {
             CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),

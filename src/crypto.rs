@@ -55,7 +55,16 @@ pub(crate) fn load_or_generate_key_and_cert(path: &Path) -> Result<Certificate, 
 pub(crate) fn generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
     let cert = Certificate::generate_self_signed(["ignored".to_owned()])?;
     let serialized = cert.serialize_pem();
-    let parent = path.parent().expect("is a path");
+    let Some(parent) = path.parent() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "certificate path has no parent directory: {}",
+                path.display()
+            ),
+        )
+        .into());
+    };
     fs::create_dir_all(parent)?;
     let f = File::create(path)?;
     #[cfg(unix)]
@@ -64,8 +73,45 @@ pub(crate) fn generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
         perm.set_mode(0o400); /* r-- --- --- */
         f.set_permissions(perm)?;
     }
-    /* FIXME windows permissions */
     let mut writer = BufWriter::new(f);
     writer.write_all(serialized.as_bytes())?;
+    writer.flush()?;
+    drop(writer);
+    #[cfg(windows)]
+    restrict_to_current_user(path);
     Ok(cert)
+}
+
+/// Restrict the private key file to the current user.
+///
+/// Windows has no chmod equivalent in std, so this shells out to `icacls`:
+/// disable inheritance (`/inheritance:r`, which drops the inherited ACEs) and
+/// grant only the current user. Best effort - a failure leaves the file
+/// readable by other accounts on the machine, which is worth a warning but not
+/// worth refusing to start over.
+#[cfg(windows)]
+fn restrict_to_current_user(path: &Path) {
+    use std::process::Command;
+
+    let Ok(user) = std::env::var("USERNAME") else {
+        log::warn!("USERNAME is not set; leaving default permissions on {path:?}");
+        return;
+    };
+    let result = Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:(R,W)"))
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {
+            log::debug!("restricted {path:?} to {user}");
+        }
+        Ok(output) => log::warn!(
+            "could not restrict permissions on {path:?}: icacls exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ),
+        Err(e) => log::warn!("could not restrict permissions on {path:?}: {e}"),
+    }
 }

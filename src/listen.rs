@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, VecDeque},
     net::{Ipv4Addr, SocketAddr},
     rc::Rc,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, PoisonError, RwLock},
     time::Duration,
 };
 use thiserror::Error;
@@ -96,22 +96,27 @@ impl DtlsListener {
             let connection_attempts = connection_attempts.clone();
             Some(Arc::new(
                 move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
-                    assert!(certs.len() == 1);
-                    let fingerprints = certs
-                        .iter()
-                        .map(|c| crypto::generate_fingerprint(c))
-                        .collect::<Vec<_>>();
+                    // Everything here comes from an unauthenticated peer, so
+                    // it must only ever reject the connection - never abort
+                    // the process.
+                    let [cert] = certs else {
+                        log::warn!(
+                            "rejecting connection: expected exactly one peer certificate, got {}",
+                            certs.len()
+                        );
+                        return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
+                    };
+                    let fingerprint = crypto::generate_fingerprint(cert);
                     if authorized
                         .read()
-                        .expect("lock")
-                        .contains_key(&fingerprints[0])
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .contains_key(&fingerprint)
                     {
                         Ok(())
                     } else {
-                        let fingerprint = fingerprints.into_iter().next().expect("fingerprint");
                         connection_attempts
                             .lock()
-                            .expect("lock")
+                            .unwrap_or_else(PoisonError::into_inner)
                             .push_back(fingerprint);
                         Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
                     }
@@ -166,7 +171,7 @@ impl DtlsListener {
                                     if let Some(e) = e.0.downcast_ref::<webrtc_dtls::Error>() {
                                         match e {
                                             webrtc_dtls::Error::ErrVerifyDataMismatch => {
-                                                if let Some(fingerprint) = connection_attempts.lock().expect("lock").pop_front() {
+                                                if let Some(fingerprint) = connection_attempts.lock().unwrap_or_else(PoisonError::into_inner).pop_front() {
                                                     listen_tx.send(ListenEvent::Rejected { fingerprint }).expect("channel closed");
                                                 }
                                             }
@@ -358,10 +363,10 @@ async fn read_loop(
     log::info!("dtls client disconnected {addr:?}");
     peer_capabilities.remove(addr);
     let mut conns = conns.lock().await;
-    let index = conns
-        .iter()
-        .position(|(a, _)| *a == addr)
-        .expect("connection not found");
-    conns.remove(index);
+    // The entry may already be gone if the listener was torn down while this
+    // read loop was still running.
+    if let Some(index) = conns.iter().position(|(a, _)| *a == addr) {
+        conns.remove(index);
+    }
     Ok(())
 }

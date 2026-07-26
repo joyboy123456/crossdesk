@@ -32,24 +32,29 @@ const SERVICE_PROBE_TIMEOUT: Duration = Duration::from_millis(75);
 #[cfg(feature = "gui")]
 const SERVICE_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// Anything that can end the process.
+///
+/// Each variant names its subsystem: this error is what the user sees on
+/// stderr, and a bare "No such file or directory" gives them nothing to act
+/// on.
 #[derive(Debug, Error)]
 pub enum CrossDeskError {
-    #[error(transparent)]
+    #[error("service: {0}")]
     Service(#[from] ServiceError),
-    #[error(transparent)]
+    #[error("frontend ipc: {0}")]
     Ipc(#[from] IpcError),
-    #[error(transparent)]
+    #[error("configuration: {0}")]
     Config(#[from] ConfigError),
-    #[error(transparent)]
+    #[error("io: {0}")]
     Io(#[from] io::Error),
-    #[error(transparent)]
+    #[error("input capture: {0}")]
     Capture(#[from] InputCaptureError),
-    #[error(transparent)]
+    #[error("input emulation: {0}")]
     Emulation(#[from] InputEmulationError),
     #[cfg(feature = "gui")]
-    #[error(transparent)]
+    #[error("user interface: {0}")]
     Ui(#[from] crossdesk_ui::UiError),
-    #[error(transparent)]
+    #[error("command line interface: {0}")]
     Cli(#[from] CliError),
 }
 

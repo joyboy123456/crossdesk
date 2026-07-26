@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, RwLock},
+    sync::{Arc, PoisonError, RwLock},
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
@@ -80,6 +80,23 @@ struct Incoming {
     fingerprint: String,
     addr: SocketAddr,
     pos: Position,
+}
+
+/// Build the command that runs a user-configured enter hook through the
+/// platform's shell, so hooks can use pipes, quoting and built-ins.
+fn shell_command(cmd: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("cmd");
+        command.arg("/C").arg(cmd);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(cmd);
+        command
+    }
 }
 
 impl Service {
@@ -165,9 +182,14 @@ impl Service {
                         self.handle_clipboard_event(event);
                     }
                 },
-                _ = self.config.changed() => self.handle_config_change(),
+                changed = self.config.changed() => match changed {
+                    Ok(()) => self.handle_config_change(),
+                    Err(e) => log::warn!("config file watcher: {e}"),
+                },
                 r = signal::ctrl_c() => {
-                    r.expect("failed to wait for CTRL+C");
+                    if let Err(e) = r {
+                        log::warn!("could not listen for CTRL+C: {e}");
+                    }
                     self.shutdown_requested = true;
                 },
             }
@@ -181,7 +203,7 @@ impl Service {
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
         log::debug!("terminating clipboard sync ...");
-        self.clipboard.terminate();
+        self.clipboard.terminate().await;
 
         Ok(())
     }
@@ -264,7 +286,11 @@ impl Service {
             })
             .collect();
         self.config.set_clients(clients);
-        let authorized_keys = self.authorized_keys.read().expect("lock").clone();
+        let authorized_keys = self
+            .authorized_keys
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         self.config.set_authorized_keys(authorized_keys);
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
@@ -278,7 +304,9 @@ impl Service {
         for c in self.config.clients() {
             let handle = self.client_manager.add_with_config(c);
             log::info!("added client {handle}");
-            let (c, s) = self.client_manager.get_state(handle).unwrap();
+            let Some((c, s)) = self.client_manager.get_state(handle) else {
+                continue;
+            };
             if s.active {
                 self.client_manager.deactivate_client(handle);
                 self.activate_client(handle);
@@ -290,7 +318,7 @@ impl Service {
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .clone_from(&authorized_keys);
         self.set_clipboard_enabled(self.config.clipboard_sync());
         self.sync_frontend();
@@ -423,7 +451,11 @@ impl Service {
             self.public_key_fingerprint.clone(),
         ));
         self.notify_clipboard_state();
-        let keys = self.authorized_keys.read().expect("lock").clone();
+        let keys = self
+            .authorized_keys
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
@@ -445,12 +477,24 @@ impl Service {
     }
 
     fn update_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
-        let incoming = self
+        let Some(incoming) = self
             .incoming_conn_info
-            .iter_mut()
-            .find(|(_, i)| i.addr == addr)
-            .map(|(_, i)| i)
-            .expect("no such client");
+            .values_mut()
+            .find(|i| i.addr == addr)
+        else {
+            // `incoming_conns` says we know this address but no capture is
+            // registered for it, so the two tables have drifted apart.
+            // Re-register the connection rather than take down the service.
+            log::warn!("no capture registered for {addr}; registering it again");
+            self.incoming_conns.remove(&addr);
+            self.add_incoming(addr, pos, fingerprint.clone());
+            self.notify_frontend(FrontendEvent::DeviceEntered {
+                fingerprint,
+                addr,
+                pos,
+            });
+            return;
+        };
         let mut changed = false;
         if incoming.fingerprint != fingerprint {
             incoming.fingerprint = fingerprint.clone();
@@ -491,14 +535,28 @@ impl Service {
     }
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {
-        self.authorized_keys.write().expect("lock").insert(fp, desc);
-        let keys = self.authorized_keys.read().expect("lock").clone();
+        self.authorized_keys
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(fp, desc);
+        let keys = self
+            .authorized_keys
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
-        self.authorized_keys.write().expect("lock").remove(&fp);
-        let keys = self.authorized_keys.read().expect("lock").clone();
+        self.authorized_keys
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&fp);
+        let keys = self
+            .authorized_keys
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
@@ -510,7 +568,9 @@ impl Service {
     fn add_client(&mut self) {
         let handle = self.client_manager.add_client();
         log::info!("added client {handle}");
-        let (c, s) = self.client_manager.get_state(handle).unwrap();
+        let Some((c, s)) = self.client_manager.get_state(handle) else {
+            return;
+        };
         self.notify_frontend(FrontendEvent::Created(handle, c, s));
     }
 
@@ -634,7 +694,7 @@ impl Service {
         };
         tokio::task::spawn_local(async move {
             log::info!("spawning command!");
-            let mut child = match Command::new("sh").arg("-c").arg(cmd.as_str()).spawn() {
+            let mut child = match shell_command(&cmd).spawn() {
                 Ok(c) => c,
                 Err(e) => {
                     log::warn!("could not execute cmd: {e}");

@@ -221,14 +221,20 @@ impl Connection {
                     return Err(ConnectionError::TargetEmulationDisabled);
                 }
                 match conn.send(buf).await {
-                    Ok(_) => observability::record_sent(&event),
+                    Ok(_) => {
+                        observability::record_sent(&event);
+                        log::trace!("{event} >->->->->- {addr}");
+                        return Ok(());
+                    }
                     Err(e) => {
+                        // The caller releases the capture when a send
+                        // fails; reporting success here would strand the
+                        // pointer on a peer we can no longer reach.
                         log::warn!("client {handle} failed to send: {e}");
                         self.ctx.disconnect(handle, addr).await;
+                        return Err(e.into());
                     }
                 }
-                log::trace!("{event} >->->->->- {addr}");
-                return Ok(());
             }
         }
 

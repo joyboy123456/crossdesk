@@ -68,21 +68,39 @@ impl ClipboardSync {
         }
     }
 
-    pub(crate) fn terminate(&mut self) {
-        let _ = self.request_tx.send(ClipboardRequest::Terminate);
-        if let Some(worker) = self.worker.take() {
-            if worker.join().is_err() {
-                log::warn!("clipboard worker panicked");
-            }
+    /// Stop the worker and wait for it to exit.
+    ///
+    /// `arboard` is a blocking API, so the worker is an OS thread; joining it
+    /// happens on the blocking pool to keep the async runtime thread free.
+    pub(crate) async fn terminate(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        if self
+            .request_tx
+            .try_send(ClipboardRequest::Terminate)
+            .is_err()
+        {
+            // Nothing is reading the request queue. Dropping this
+            // ClipboardSync closes the channel, which stops the worker; a
+            // join here could block forever.
+            log::warn!("clipboard worker did not accept the stop request");
+            return;
+        }
+        match tokio::task::spawn_blocking(move || worker.join()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => log::warn!("clipboard worker panicked"),
+            Err(e) => log::warn!("failed to join clipboard worker: {e}"),
         }
     }
 }
 
 impl Drop for ClipboardSync {
     fn drop(&mut self) {
-        if self.worker.is_some() {
-            self.terminate();
-        }
+        // Detached on purpose: dropping the sender makes the worker's
+        // recv_timeout return Disconnected and exit on its own, and Drop must
+        // not block whichever thread happens to run it.
+        let _ = self.request_tx.try_send(ClipboardRequest::Terminate);
     }
 }
 

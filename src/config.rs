@@ -413,10 +413,18 @@ impl Config {
         Ok(())
     }
 
+    /// Wait until the config file changed on disk and was re-read.
+    ///
+    /// Never resolves once the watcher is gone, so a dead watcher degrades to
+    /// "no hot reload" instead of taking the service down.
     pub async fn changed(&mut self) -> Result<(), notify::Error> {
         loop {
-            let event = self.watch_rx.recv().await.expect("channel closed");
-            let event = event.expect("filesystem event");
+            let Some(event) = self.watch_rx.recv().await else {
+                log::warn!("config file watcher stopped; hot reload is disabled");
+                std::future::pending::<()>().await;
+                unreachable!("pending never resolves");
+            };
+            let event = event?;
             if event.paths.contains(&self.config_path)
                 && matches!(
                     event.kind,
