@@ -13,6 +13,9 @@ concurrency:
 
 jobs:
   nix:
+    # the cache is the upstream project's; a fork has no CACHIX_AUTH_TOKEN and
+    # would only ever report a red cross for a missing secret
+    if: github.repository == 'feschber/lan-mouse'
     strategy:
       matrix:
         os:

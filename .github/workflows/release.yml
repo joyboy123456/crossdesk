@@ -85,11 +85,22 @@ jobs:
         Copy-Item -Path "target\release\crossdesk.exe" -Destination "crossdesk-windows\CrossDesk.exe"
         Copy-Item -Path "target\release\lan-mouse.exe" -Destination "crossdesk-windows\lan-mouse.exe"
         Compress-Archive -Path "crossdesk-windows\*" -DestinationPath crossdesk-windows-x86_64.zip
+    - name: Build installer
+      run: |
+        choco install nsis -y --no-progress
+        $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' |
+          Select-Object -First 1).Matches.Groups[1].Value
+        $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+        & $makensis /DVERSION=$version /DSOURCE_DIR=$PWD `
+          /DOUTFILE="$PWD\CrossDesk-Setup-x86_64.exe" build-aux\windows-installer.nsi
+        if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
     - name: Upload build artifact
       uses: actions/upload-artifact@v6
       with:
         name: crossdesk-windows-x86_64
-        path: crossdesk-windows-x86_64.zip
+        path: |
+          crossdesk-windows-x86_64.zip
+          CrossDesk-Setup-x86_64.exe
 
   macos-release-build:
     runs-on: macos-15-intel
@@ -176,6 +187,7 @@ jobs:
           crossdesk-macos-intel/crossdesk-macos-intel.zip
           crossdesk-macos-arm64/crossdesk-macos-arm64.zip
           crossdesk-windows-x86_64/crossdesk-windows-x86_64.zip
+          crossdesk-windows-x86_64/CrossDesk-Setup-x86_64.exe
     - name: Create Tagged Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
@@ -195,3 +207,4 @@ jobs:
           crossdesk-macos-intel/crossdesk-macos-intel.zip
           crossdesk-macos-arm64/crossdesk-macos-arm64.zip
           crossdesk-windows-x86_64/crossdesk-windows-x86_64.zip
+          crossdesk-windows-x86_64/CrossDesk-Setup-x86_64.exe
