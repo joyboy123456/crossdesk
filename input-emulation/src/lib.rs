@@ -32,6 +32,27 @@ mod error;
 
 pub type EmulationHandle = u64;
 
+/// Edge of the local desktop through which a remote cursor enters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Position {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl Display for Position {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pos = match self {
+            Position::Left => "left",
+            Position::Right => "right",
+            Position::Top => "top",
+            Position::Bottom => "bottom",
+        };
+        write!(f, "{pos}")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
     #[cfg(wlroots)]
@@ -153,6 +174,12 @@ impl InputEmulation {
         }
     }
 
+    /// place the local cursor where the remote cursor entered: at `ratio`
+    /// (normalized, top/left = 0.0) along the edge `pos`
+    pub async fn enter(&mut self, handle: EmulationHandle, pos: Position, ratio: f64) {
+        self.emulation.enter(handle, pos, ratio).await
+    }
+
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
@@ -237,4 +264,8 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+    /// place the local cursor where the remote cursor entered: at `ratio`
+    /// (normalized, top/left = 0.0) along the edge `pos`. Backends that
+    /// cannot position the cursor keep the default no-op.
+    async fn enter(&mut self, _handle: EmulationHandle, _pos: Position, _ratio: f64) {}
 }

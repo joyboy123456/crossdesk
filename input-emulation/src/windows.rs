@@ -8,6 +8,10 @@ use async_trait::async_trait;
 use std::ops::BitOrAssign;
 use std::time::Duration;
 use tokio::task::AbortHandle;
+use windows::Win32::Foundation::POINT;
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
@@ -17,9 +21,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
 };
-use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SetCursorPos, XBUTTON1, XBUTTON2,
+};
 
-use super::{Emulation, EmulationHandle};
+use super::{Emulation, EmulationHandle, Position};
 
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
@@ -80,6 +87,56 @@ impl Emulation for WindowsEmulation {
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
     async fn terminate(&mut self) {}
+
+    async fn enter(&mut self, _handle: EmulationHandle, pos: Position, ratio: f64) {
+        let bbox = unsafe {
+            let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            (x, y, x + w, y + h)
+        };
+        let (x, y) = point_on_edge(bbox, pos, ratio);
+
+        /* the mapped point may fall on a stretch of the virtual-screen edge
+         * where no display exists; clamp into the nearest monitor */
+        let (x, y) = snap_to_nearest_monitor(x, y);
+        if let Err(e) = unsafe { SetCursorPos(x, y) } {
+            log::warn!("SetCursorPos({x}, {y}) failed: {e}");
+        }
+    }
+}
+
+/// the point at `ratio` along the edge `pos` of the virtual screen bounding
+/// box `(left, top, right, bottom)`, moved 1px inward from the edge
+fn point_on_edge(bbox: (i32, i32, i32, i32), pos: Position, ratio: f64) -> (i32, i32) {
+    let (left, top, right, bottom) = bbox;
+    let ratio = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let along = |min: i32, max: i32| min + ((max - min) as f64 * ratio).round() as i32;
+    match pos {
+        Position::Left => (left + 1, along(top, bottom - 1)),
+        Position::Right => (right - 2, along(top, bottom - 1)),
+        Position::Top => (along(left, right - 1), top + 1),
+        Position::Bottom => (along(left, right - 1), bottom - 2),
+    }
+}
+
+fn snap_to_nearest_monitor(x: i32, y: i32) -> (i32, i32) {
+    let monitor = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        let r = info.rcMonitor;
+        (x.clamp(r.left, r.right - 1), y.clamp(r.top, r.bottom - 1))
+    } else {
+        (x, y)
+    }
 }
 
 impl WindowsEmulation {
@@ -234,4 +291,42 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
     };
     log::trace!("windows code: {windows_scancode:?}");
     Some(windows_scancode as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Position, point_on_edge};
+
+    const BBOX: (i32, i32, i32, i32) = (0, 0, 1920, 1080);
+
+    #[test]
+    fn point_on_edge_stays_inside_the_bbox() {
+        for pos in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            for ratio in [0.0, 0.5, 1.0] {
+                let (x, y) = point_on_edge(BBOX, pos, ratio);
+                assert!((0..1920).contains(&x), "{pos:?} @ {ratio}: x = {x}");
+                assert!((0..1080).contains(&y), "{pos:?} @ {ratio}: y = {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn ratio_maps_along_the_edge() {
+        assert_eq!(point_on_edge(BBOX, Position::Left, 0.0), (1, 0));
+        assert_eq!(point_on_edge(BBOX, Position::Right, 1.0), (1918, 1079));
+        assert_eq!(point_on_edge(BBOX, Position::Bottom, 0.5), (960, 1078));
+    }
+
+    #[test]
+    fn abnormal_ratio_falls_back_to_center() {
+        assert_eq!(
+            point_on_edge(BBOX, Position::Right, f64::NAN),
+            point_on_edge(BBOX, Position::Right, 0.5)
+        );
+    }
 }

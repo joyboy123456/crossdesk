@@ -1,4 +1,4 @@
-use super::{Emulation, EmulationHandle, error::EmulationError};
+use super::{Emulation, EmulationHandle, Position, error::EmulationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::base::TCFType;
@@ -9,7 +9,7 @@ use core_foundation_sys::preferences::{
 };
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
-    CGDirectDisplayID, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
+    CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
 };
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
@@ -586,6 +586,88 @@ impl Emulation for MacOSEmulation {
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
     async fn terminate(&mut self) {}
+
+    async fn enter(&mut self, _handle: EmulationHandle, pos: Position, ratio: f64) {
+        let Some(bounds) = desktop_bounds() else {
+            log::warn!("could not determine desktop bounds, not placing cursor");
+            return;
+        };
+        let location = point_on_edge(bounds, pos, ratio);
+
+        /* the mapped point may fall on a stretch of the bounding-box edge
+         * where no display exists; clamp into the current display then */
+        let location = match get_display_at_point(location.x, location.y) {
+            Some(_) => location,
+            None => {
+                let (min_x, min_y, max_x, max_y) = match self
+                    .get_mouse_location()
+                    .and_then(|l| get_display_at_point(l.x, l.y))
+                {
+                    Some(display) => get_display_bounds(display),
+                    None => return,
+                };
+                CGPoint::new(
+                    location.x.clamp(min_x, max_x - 1.),
+                    location.y.clamp(min_y, max_y - 1.),
+                )
+            }
+        };
+
+        /* post an absolute mouse-moved event rather than warping: it takes
+         * the same path as regular Motion injection and is not affected by
+         * the warp suppression interval */
+        let event = match CGEvent::new_mouse_event(
+            self.event_source.clone(),
+            CGEventType::MouseMoved,
+            location,
+            CGMouseButton::Left,
+        ) {
+            Ok(e) => e,
+            Err(()) => {
+                log::warn!("mouse event creation failed!");
+                return;
+            }
+        };
+        event.post(CGEventTapLocation::HID);
+    }
+}
+
+/// bounding box `(min_x, min_y, max_x, max_y)` of all active displays
+fn desktop_bounds() -> Option<(CGFloat, CGFloat, CGFloat, CGFloat)> {
+    let displays = CGDisplay::active_displays().ok()?;
+    let mut bounds: Option<(CGFloat, CGFloat, CGFloat, CGFloat)> = None;
+    for display in displays {
+        let (min_x, min_y, max_x, max_y) = get_display_bounds(display);
+        bounds = Some(match bounds {
+            Some((x0, y0, x1, y1)) => (x0.min(min_x), y0.min(min_y), x1.max(max_x), y1.max(max_y)),
+            None => (min_x, min_y, max_x, max_y),
+        });
+    }
+    bounds
+}
+
+/// the point at `ratio` along the edge `pos` of the desktop bounding box,
+/// moved 1pt inward from the edge
+fn point_on_edge(
+    bounds: (CGFloat, CGFloat, CGFloat, CGFloat),
+    pos: Position,
+    ratio: f64,
+) -> CGPoint {
+    let (min_x, min_y, max_x, max_y) = bounds;
+    let ratio = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let edge_offset = 1.0;
+    let along = |min: CGFloat, max: CGFloat| min + (max - min) * ratio;
+    let (x, y) = match pos {
+        Position::Left => (min_x + edge_offset, along(min_y, max_y)),
+        Position::Right => (max_x - edge_offset, along(min_y, max_y)),
+        Position::Top => (along(min_x, max_x), min_y + edge_offset),
+        Position::Bottom => (along(min_x, max_x), max_y - edge_offset),
+    };
+    CGPoint::new(x, y)
 }
 
 fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
@@ -668,7 +750,26 @@ bitflags! {
 
 #[cfg(test)]
 mod tests {
-    use super::wire_scroll_to_cgevent;
+    use super::{Position, point_on_edge, wire_scroll_to_cgevent};
+
+    const BOUNDS: (f64, f64, f64, f64) = (0.0, 0.0, 1512.0, 982.0);
+
+    #[test]
+    fn point_on_edge_maps_ratio_along_the_edge() {
+        let p = point_on_edge(BOUNDS, Position::Left, 0.0);
+        assert_eq!((p.x, p.y), (1.0, 0.0));
+        let p = point_on_edge(BOUNDS, Position::Right, 1.0);
+        assert_eq!((p.x, p.y), (1511.0, 982.0));
+        let p = point_on_edge(BOUNDS, Position::Bottom, 0.5);
+        assert_eq!((p.x, p.y), (756.0, 981.0));
+    }
+
+    #[test]
+    fn abnormal_ratio_falls_back_to_center() {
+        let nan = point_on_edge(BOUNDS, Position::Right, f64::NAN);
+        let mid = point_on_edge(BOUNDS, Position::Right, 0.5);
+        assert_eq!((nan.x, nan.y), (mid.x, mid.y));
+    }
 
     #[test]
     fn inverts_wire_scroll_when_natural_scrolling_off() {
