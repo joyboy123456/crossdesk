@@ -31,6 +31,8 @@ use input_event::{
     scancode::{self, Linux},
 };
 
+#[cfg(feature = "metrics")]
+use super::EVENT_CHANNEL_CAPACITY;
 use super::{CaptureEvent, Position, display_util};
 
 pub(crate) struct EventThread {
@@ -99,14 +101,48 @@ enum ClientUpdate {
 }
 
 fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
+    EVENT_TX.with_borrow_mut(|tx| {
+        let tx = tx.as_mut().unwrap();
+        #[cfg(feature = "metrics")]
+        let kind = crate::observability::event_kind(&event);
+        let result = tx.blocking_send((pos, event));
+        #[cfg(feature = "metrics")]
+        if result.is_ok() {
+            crate::observability::record_enqueued(
+                "windows_capture",
+                kind,
+                EVENT_CHANNEL_CAPACITY.saturating_sub(tx.capacity()),
+            );
+        }
+        result.unwrap();
+    })
 }
 
 fn try_send_event(
     pos: Position,
     event: CaptureEvent,
 ) -> Result<(), TrySendError<(Position, CaptureEvent)>> {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((pos, event)))
+    EVENT_TX.with_borrow_mut(|tx| {
+        let tx = tx.as_mut().unwrap();
+        #[cfg(feature = "metrics")]
+        let kind = crate::observability::event_kind(&event);
+        let result = tx.try_send((pos, event));
+        #[cfg(feature = "metrics")]
+        match &result {
+            Ok(()) => crate::observability::record_enqueued(
+                "windows_capture",
+                kind,
+                EVENT_CHANNEL_CAPACITY.saturating_sub(tx.capacity()),
+            ),
+            Err(TrySendError::Full(_)) => crate::observability::record_full_drop(
+                "windows_capture",
+                kind,
+                EVENT_CHANNEL_CAPACITY,
+            ),
+            Err(TrySendError::Closed(_)) => {}
+        }
+        result
+    })
 }
 
 thread_local! {

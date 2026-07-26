@@ -15,6 +15,9 @@ pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 
 pub mod error;
 
+#[cfg(feature = "metrics")]
+mod observability;
+
 #[cfg(libei)]
 mod libei;
 

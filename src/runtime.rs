@@ -1,0 +1,166 @@
+use crate::{
+    capture_test,
+    config::{Command, Config, ConfigError},
+    emulation_test,
+    service::{Service, ServiceError},
+};
+use env_logger::Env;
+use input_capture::InputCaptureError;
+use input_emulation::InputEmulationError;
+use lan_mouse_cli::CliError;
+use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
+use std::{future::Future, io, process};
+#[cfg(feature = "gui")]
+use std::{
+    process::Child,
+    thread,
+    time::{Duration, Instant},
+};
+use thiserror::Error;
+use tokio::task::LocalSet;
+
+#[cfg(feature = "gui")]
+const SERVICE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Error)]
+pub enum LanMouseError {
+    #[error(transparent)]
+    Service(#[from] ServiceError),
+    #[error(transparent)]
+    Ipc(#[from] IpcError),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Capture(#[from] InputCaptureError),
+    #[error(transparent)]
+    Emulation(#[from] InputEmulationError),
+    #[cfg(feature = "gui")]
+    #[error(transparent)]
+    Ui(#[from] crossdesk_ui::UiError),
+    #[error(transparent)]
+    Cli(#[from] CliError),
+}
+
+pub fn main() {
+    let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
+    let _ = env_logger::Builder::from_env(env).try_init();
+
+    if let Err(error) = run() {
+        log::error!("{error}");
+        process::exit(1);
+    }
+}
+
+pub fn run() -> Result<(), LanMouseError> {
+    let config = Config::new()?;
+    match config.command() {
+        Some(Command::TestEmulation(args)) => run_async(emulation_test::run(config, args))?,
+        Some(Command::TestCapture(args)) => run_async(capture_test::run(config, args))?,
+        Some(Command::Cli(args)) => run_async(lan_mouse_cli::run(args))?,
+        Some(Command::Daemon) => match run_async(run_service(config)) {
+            Err(LanMouseError::Service(ServiceError::IpcListen(
+                IpcListenerCreationError::AlreadyRunning,
+            ))) => log::info!("service already running"),
+            result => result?,
+        },
+        None => run_default(config)?,
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "gui")]
+fn run_default(_config: Config) -> Result<(), LanMouseError> {
+    let mut service = start_service_if_needed()?;
+    let result = crossdesk_ui::run(crate::config::local_commit(), service.is_some());
+
+    if let Some(child) = service.as_mut() {
+        finish_owned_service(child)?;
+    }
+
+    result?;
+    Ok(())
+}
+
+#[cfg(not(feature = "gui"))]
+fn run_default(config: Config) -> Result<(), LanMouseError> {
+    match run_async(run_service(config)) {
+        Err(LanMouseError::Service(ServiceError::IpcListen(
+            IpcListenerCreationError::AlreadyRunning,
+        ))) => log::info!("service already running"),
+        result => result?,
+    }
+    Ok(())
+}
+
+fn run_async<F, E>(future: F) -> Result<(), LanMouseError>
+where
+    F: Future<Output = Result<(), E>>,
+    LanMouseError: From<E>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    Ok(runtime.block_on(LocalSet::new().run_until(future))?)
+}
+
+#[cfg(feature = "gui")]
+fn start_service_if_needed() -> Result<Option<Child>, io::Error> {
+    if service_is_running() {
+        log::info!("using existing service");
+        return Ok(None);
+    }
+
+    let child = process::Command::new(std::env::current_exe()?)
+        .args(std::env::args().skip(1))
+        .arg("daemon")
+        .spawn()?;
+    Ok(Some(child))
+}
+
+#[cfg(feature = "gui")]
+fn service_is_running() -> bool {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+    else {
+        return false;
+    };
+    runtime
+        .block_on(lan_mouse_ipc::connect_async(Some(Duration::from_millis(
+            75,
+        ))))
+        .is_ok()
+}
+
+#[cfg(feature = "gui")]
+fn finish_owned_service(child: &mut Child) -> Result<(), io::Error> {
+    let deadline = Instant::now() + SERVICE_SHUTDOWN_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            log::warn!("service did not stop in time; terminating child process");
+            child.kill()?;
+            child.wait()?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+async fn run_service(config: Config) -> Result<(), ServiceError> {
+    let release_bind = config.release_bind();
+    let config_path = config.config_path().to_owned();
+    let mut service = Service::new(config).await?;
+    log::info!("using config: {config_path:?}");
+    log::info!("Press {release_bind:?} to release the mouse");
+    service.run().await?;
+    log::info!("service exited");
+    Ok(())
+}

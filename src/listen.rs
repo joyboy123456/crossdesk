@@ -1,8 +1,12 @@
 use futures::{Stream, StreamExt};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{
+    CAPABILITY_CLIPBOARD_TEXT, MAX_EVENT_SIZE, MAX_WIRE_SIZE, ProtoEvent, WireEvent,
+    decode_wire_event, encode_clipboard_text,
+};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     rc::Rc,
@@ -22,7 +26,10 @@ use webrtc_dtls::{
 };
 use webrtc_util::{Conn, Error, conn::Listener};
 
-use crate::crypto;
+use crate::{
+    crypto,
+    observability::{self, Timestamp},
+};
 
 #[derive(Error, Debug)]
 pub enum ListenerCreationError {
@@ -36,8 +43,9 @@ type ArcConn = Arc<dyn Conn + Send + Sync>;
 
 pub(crate) enum ListenEvent {
     Msg {
-        event: ProtoEvent,
+        event: WireEvent,
         addr: SocketAddr,
+        received_at: Timestamp,
     },
     Accept {
         addr: SocketAddr,
@@ -55,6 +63,7 @@ pub(crate) struct LanMouseListener {
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
+    peer_capabilities: Rc<RefCell<HashMap<SocketAddr, u32>>>,
 }
 
 type VerifyPeerCertificateFn = Arc<
@@ -114,8 +123,10 @@ impl LanMouseListener {
 
         let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
             Rc::new(AsyncMutex::new(Vec::new()));
+        let peer_capabilities: Rc<RefCell<HashMap<SocketAddr, u32>>> = Default::default();
 
         let conns_clone = conns.clone();
+        let peer_capabilities_clone = peer_capabilities.clone();
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
             let connection_attempts = connection_attempts.clone();
@@ -135,7 +146,13 @@ impl LanMouseListener {
                                 let cert = certs.first().expect("cert");
                                 let fingerprint = crypto::generate_fingerprint(cert);
                                 listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
-                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
+                                spawn_local(read_loop(
+                                    conns_clone.clone(),
+                                    addr,
+                                    conn,
+                                    listen_tx.clone(),
+                                    peer_capabilities_clone.clone(),
+                                ));
                             },
                             Err(e) => {
                                 if let Error::Std(ref e) = e {
@@ -183,6 +200,7 @@ impl LanMouseListener {
             listen_task,
             port_changed,
             request_port_change,
+            peer_capabilities,
         })
     }
 
@@ -210,6 +228,58 @@ impl LanMouseListener {
         for (a, conn) in conns.iter() {
             if *a == addr {
                 let _ = conn.send(&buf[..len]).await;
+            }
+        }
+    }
+
+    pub(crate) fn set_peer_capabilities(&self, addr: SocketAddr, capabilities: u32) {
+        self.peer_capabilities
+            .borrow_mut()
+            .insert(addr, capabilities);
+    }
+
+    pub(crate) async fn send_clipboard(&self, addr: SocketAddr, text: &str) {
+        if self
+            .peer_capabilities
+            .borrow()
+            .get(&addr)
+            .is_none_or(|capabilities| capabilities & CAPABILITY_CLIPBOARD_TEXT == 0)
+        {
+            return;
+        }
+        let packet = match encode_clipboard_text(text) {
+            Ok(packet) => packet,
+            Err(error) => {
+                log::warn!("clipboard text was not sent to {addr}: {error}");
+                return;
+            }
+        };
+        let conns = self.conns.lock().await;
+        if let Some((_, conn)) = conns.iter().find(|(peer, _)| *peer == addr) {
+            if let Err(error) = conn.send(&packet).await {
+                log::warn!("failed to send clipboard text to {addr}: {error}");
+            }
+        }
+    }
+
+    pub(crate) async fn broadcast_clipboard(&self, text: &str) {
+        let packet = match encode_clipboard_text(text) {
+            Ok(packet) => packet,
+            Err(error) => {
+                log::warn!("clipboard text was not broadcast: {error}");
+                return;
+            }
+        };
+        let capable = self.peer_capabilities.borrow().clone();
+        let conns = self.conns.lock().await;
+        for (addr, conn) in conns.iter() {
+            if capable
+                .get(addr)
+                .is_some_and(|capabilities| capabilities & CAPABILITY_CLIPBOARD_TEXT != 0)
+            {
+                if let Err(error) = conn.send(&packet).await {
+                    log::warn!("failed to send clipboard text to {addr}: {error}");
+                }
             }
         }
     }
@@ -250,14 +320,25 @@ async fn read_loop(
     addr: SocketAddr,
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
+    peer_capabilities: Rc<RefCell<HashMap<SocketAddr, u32>>>,
 ) -> Result<(), Error> {
-    let mut b = [0u8; MAX_EVENT_SIZE];
+    let mut b = vec![0u8; MAX_WIRE_SIZE];
 
-    while conn.recv(&mut b).await.is_ok() {
-        match b.try_into() {
-            Ok(event) => dtls_tx
-                .send(ListenEvent::Msg { event, addr })
-                .expect("channel closed"),
+    while let Ok(len) = conn.recv(&mut b).await {
+        let received_at = Timestamp::now();
+        match decode_wire_event(&b[..len]) {
+            Ok(event) => {
+                if let WireEvent::Protocol(event) = &event {
+                    observability::record_received(event);
+                }
+                dtls_tx
+                    .send(ListenEvent::Msg {
+                        event,
+                        addr,
+                        received_at,
+                    })
+                    .expect("channel closed")
+            }
             Err(e) => {
                 // Skip the malformed/unknown datagram and keep
                 // listening. Each DTLS recv returns one full
@@ -273,6 +354,7 @@ async fn read_loop(
         }
     }
     log::info!("dtls client disconnected {addr:?}");
+    peer_capabilities.borrow_mut().remove(&addr);
     let mut conns = conns.lock().await;
     let index = conns
         .iter()

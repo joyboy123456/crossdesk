@@ -1,11 +1,11 @@
 [workspace]
 members = [
+    "crossdesk-ui",
     "input-capture",
     "input-emulation",
     "input-event",
     "lan-mouse-ipc",
     "lan-mouse-cli",
-    "lan-mouse-gtk",
     "lan-mouse-proto",
 ]
 
@@ -16,6 +16,12 @@ version = "0.11.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/feschber/lan-mouse"
+default-run = "crossdesk"
+
+[[bin]]
+name = "crossdesk"
+path = "src/bin/crossdesk.rs"
+required-features = ["gui"]
 
 [profile.release]
 codegen-units = 1
@@ -27,13 +33,14 @@ panic = "abort"
 shadow-rs = "1.2.0"
 
 [dependencies]
+arboard = { version = "3.6.1", default-features = false }
 input-event = { path = "input-event", version = "0.4.0" }
 input-emulation = { path = "input-emulation", version = "0.4.0", default-features = false }
 input-capture = { path = "input-capture", version = "0.4.0", default-features = false }
 lan-mouse-cli = { path = "lan-mouse-cli", version = "0.3.0" }
-lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.3.0", optional = true }
-lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.3.0" }
-lan-mouse-proto = { path = "lan-mouse-proto", version = "0.3.0" }
+crossdesk-ui = { path = "crossdesk-ui", version = "0.1.0", optional = true }
+lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.4.0" }
+lan-mouse-proto = { path = "lan-mouse-proto", version = "0.4.0" }
 shadow-rs = { version = "1.2.0", features = ["metadata"] }
 
 toml = "0.8"
@@ -73,7 +80,7 @@ libc = "0.2.148"
 
 [features]
 default = [
-    "gtk",
+    "gui",
     "layer_shell_capture",
     "x11_capture",
     "libei_capture",
@@ -82,7 +89,8 @@ default = [
     "rdp_emulation",
     "x11_emulation",
 ]
-gtk = ["dep:lan-mouse-gtk"]
+metrics = ["input-capture/metrics"]
+gui = ["dep:crossdesk-ui"]
 layer_shell_capture = ["input-capture/layer_shell"]
 x11_capture = ["input-capture/x11"]
 libei_capture = ["input-event/libei", "input-capture/libei"]
@@ -92,9 +100,8 @@ x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
-name = "Lan Mouse"
+name = "CrossDesk"
 icon = ["target/icon.icns", "lan-mouse-gtk/resources/de.feschber.LanMouse.svg"]
-identifier = "de.feschber.LanMouse"
-deb_depends = [ "libadwaita-1-0" ]
+identifier = "app.crossdesk.CrossDesk"
 osx_info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 resources = ["target/menubar-template.png"]

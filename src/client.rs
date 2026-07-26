@@ -34,20 +34,22 @@ impl ClientManager {
             pos: config_client.pos,
             cmd: config_client.enter_hook,
         };
-        let state = ClientState {
-            active: config_client.active,
-            ips: HashSet::from_iter(config.fix_ips.iter().cloned()),
-            ..Default::default()
-        };
-        let handle = self.add_client();
-        self.set_config(handle, config);
-        self.set_state(handle, state);
-        handle
+        self.add_configured_client(config, config_client.active)
     }
 
     /// add a new client to this manager
     pub fn add_client(&self) -> ClientHandle {
         self.clients.borrow_mut().insert(Default::default()) as ClientHandle
+    }
+
+    /// Add a client with its complete configuration and initial active state.
+    pub fn add_configured_client(&self, config: ClientConfig, active: bool) -> ClientHandle {
+        let state = ClientState {
+            active,
+            ips: HashSet::from_iter(config.fix_ips.iter().copied()),
+            ..Default::default()
+        };
+        self.clients.borrow_mut().insert((config, state)) as ClientHandle
     }
 
     /// set the config of the given client

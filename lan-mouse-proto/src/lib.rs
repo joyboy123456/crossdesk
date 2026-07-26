@@ -12,6 +12,18 @@ use thiserror::Error;
 /// type: u8, time: u32, dx: f64, dy: f64
 pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
 
+/// Capability bit indicating support for UTF-8 clipboard text packets.
+pub const CAPABILITY_CLIPBOARD_TEXT: u32 = 1 << 0;
+
+/// Maximum UTF-8 clipboard payload accepted from a peer.
+pub const MAX_CLIPBOARD_TEXT_SIZE: usize = 16 * 1024;
+
+const CLIPBOARD_TEXT_EVENT_ID: u8 = 0x80;
+const CLIPBOARD_TEXT_HEADER_SIZE: usize = size_of::<u8>() + size_of::<u32>();
+
+/// Maximum packet size accepted by the network receive loops.
+pub const MAX_WIRE_SIZE: usize = CLIPBOARD_TEXT_HEADER_SIZE + MAX_CLIPBOARD_TEXT_SIZE;
+
 /// error type for protocol violations
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -21,6 +33,15 @@ pub enum ProtocolError {
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// a packet has an invalid or inconsistent length
+    #[error("invalid packet length: expected {expected} bytes, got {actual}")]
+    InvalidPacketLength { expected: usize, actual: usize },
+    /// a clipboard payload exceeds the protocol limit
+    #[error("clipboard text is too large: {actual} bytes (maximum {maximum})")]
+    ClipboardTooLarge { actual: usize, maximum: usize },
+    /// clipboard text is not valid UTF-8
+    #[error("clipboard text is not valid UTF-8: {0}")]
+    InvalidClipboardText(#[from] std::str::Utf8Error),
 }
 
 /// Position of a client
@@ -71,7 +92,11 @@ pub enum ProtoEvent {
     /// `shadow_rs`'s `SHORT_COMMIT`. Old peers that don't
     /// recognize the event type silently skip it per the
     /// forward-compat handling in the receive loop.
-    Hello { commit: [u8; 8] },
+    Hello {
+        commit: [u8; 8],
+        /// Optional feature bits. Legacy Hello packets decode this as zero.
+        capabilities: u32,
+    },
 }
 
 impl Display for ProtoEvent {
@@ -89,7 +114,7 @@ impl Display for ProtoEvent {
                     if *alive { "alive" } else { "not available" }
                 )
             }
-            ProtoEvent::Hello { commit } => {
+            ProtoEvent::Hello { commit, .. } => {
                 let s = std::str::from_utf8(commit).unwrap_or("????????");
                 write!(f, "Hello({s})")
             }
@@ -194,7 +219,11 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 for b in commit.iter_mut() {
                     *b = decode_u8(&mut buf)?;
                 }
-                Ok(Self::Hello { commit })
+                let capabilities = decode_u32(&mut buf)?;
+                Ok(Self::Hello {
+                    commit,
+                    capabilities,
+                })
             }
         }
     }
@@ -260,15 +289,90 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
                 ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
-                ProtoEvent::Hello { commit } => {
+                ProtoEvent::Hello {
+                    commit,
+                    capabilities,
+                } => {
                     for b in commit.iter() {
                         encode_u8(buf, len, *b);
                     }
+                    encode_u32(buf, len, capabilities);
                 }
             }
         }
         (buf, len)
     }
+}
+
+/// A decoded network packet. Input events remain fixed-size while clipboard
+/// text uses a separately negotiated variable-size packet.
+#[derive(Clone, Debug)]
+pub enum WireEvent {
+    Protocol(ProtoEvent),
+    ClipboardText(String),
+}
+
+/// Encode a UTF-8 clipboard text packet.
+pub fn encode_clipboard_text(text: &str) -> Result<Vec<u8>, ProtocolError> {
+    let bytes = text.as_bytes();
+    if bytes.len() > MAX_CLIPBOARD_TEXT_SIZE {
+        return Err(ProtocolError::ClipboardTooLarge {
+            actual: bytes.len(),
+            maximum: MAX_CLIPBOARD_TEXT_SIZE,
+        });
+    }
+
+    let mut packet = Vec::with_capacity(CLIPBOARD_TEXT_HEADER_SIZE + bytes.len());
+    packet.push(CLIPBOARD_TEXT_EVENT_ID);
+    packet.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    packet.extend_from_slice(bytes);
+    Ok(packet)
+}
+
+/// Decode either a fixed-size input protocol event or a clipboard text packet.
+pub fn decode_wire_event(data: &[u8]) -> Result<WireEvent, ProtocolError> {
+    let Some(event_id) = data.first().copied() else {
+        return Err(ProtocolError::InvalidPacketLength {
+            expected: 1,
+            actual: 0,
+        });
+    };
+
+    if event_id == CLIPBOARD_TEXT_EVENT_ID {
+        if data.len() < CLIPBOARD_TEXT_HEADER_SIZE {
+            return Err(ProtocolError::InvalidPacketLength {
+                expected: CLIPBOARD_TEXT_HEADER_SIZE,
+                actual: data.len(),
+            });
+        }
+        let payload_len = u32::from_be_bytes(data[1..5].try_into().expect("length slice")) as usize;
+        if payload_len > MAX_CLIPBOARD_TEXT_SIZE {
+            return Err(ProtocolError::ClipboardTooLarge {
+                actual: payload_len,
+                maximum: MAX_CLIPBOARD_TEXT_SIZE,
+            });
+        }
+        let expected = CLIPBOARD_TEXT_HEADER_SIZE + payload_len;
+        if data.len() != expected {
+            return Err(ProtocolError::InvalidPacketLength {
+                expected,
+                actual: data.len(),
+            });
+        }
+        return Ok(WireEvent::ClipboardText(
+            std::str::from_utf8(&data[CLIPBOARD_TEXT_HEADER_SIZE..])?.to_owned(),
+        ));
+    }
+
+    if data.len() > MAX_EVENT_SIZE {
+        return Err(ProtocolError::InvalidPacketLength {
+            expected: MAX_EVENT_SIZE,
+            actual: data.len(),
+        });
+    }
+    let mut event = [0u8; MAX_EVENT_SIZE];
+    event[..data.len()].copy_from_slice(data);
+    Ok(WireEvent::Protocol(event.try_into()?))
 }
 
 macro_rules! decode_impl {
@@ -307,3 +411,65 @@ encode_impl!(u8);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CAPABILITY_CLIPBOARD_TEXT, MAX_CLIPBOARD_TEXT_SIZE, MAX_EVENT_SIZE, ProtoEvent,
+        ProtocolError, WireEvent, decode_wire_event, encode_clipboard_text,
+    };
+
+    #[test]
+    fn hello_capabilities_round_trip() {
+        let event = ProtoEvent::Hello {
+            commit: *b"deadbeef",
+            capabilities: CAPABILITY_CLIPBOARD_TEXT,
+        };
+        let (packet, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+
+        let WireEvent::Protocol(ProtoEvent::Hello {
+            commit,
+            capabilities,
+        }) = decode_wire_event(&packet[..len]).expect("decode hello")
+        else {
+            panic!("expected hello event");
+        };
+        assert_eq!(commit, *b"deadbeef");
+        assert_eq!(capabilities, CAPABILITY_CLIPBOARD_TEXT);
+    }
+
+    #[test]
+    fn legacy_hello_defaults_capabilities_to_zero() {
+        let mut packet = [0u8; MAX_EVENT_SIZE];
+        packet[0] = super::EventType::Hello as u8;
+        packet[1..9].copy_from_slice(b"cafebabe");
+
+        let ProtoEvent::Hello { capabilities, .. } =
+            ProtoEvent::try_from(packet).expect("decode legacy hello")
+        else {
+            panic!("expected hello event");
+        };
+        assert_eq!(capabilities, 0);
+    }
+
+    #[test]
+    fn clipboard_text_round_trips_as_utf8() {
+        let packet = encode_clipboard_text("CrossDesk clipboard: hello").expect("encode clipboard");
+
+        let WireEvent::ClipboardText(text) = decode_wire_event(&packet).expect("decode clipboard")
+        else {
+            panic!("expected clipboard text");
+        };
+        assert_eq!(text, "CrossDesk clipboard: hello");
+    }
+
+    #[test]
+    fn clipboard_text_limit_is_enforced() {
+        let text = "x".repeat(MAX_CLIPBOARD_TEXT_SIZE + 1);
+
+        assert!(matches!(
+            encode_clipboard_text(&text),
+            Err(ProtocolError::ClipboardTooLarge { .. })
+        ));
+    }
+}

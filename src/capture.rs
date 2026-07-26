@@ -9,12 +9,15 @@ use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
-use lan_mouse_proto::ProtoEvent;
+use lan_mouse_proto::{ProtoEvent, WireEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::{
+    connect::LanMouseConnection,
+    observability::{self, Timestamp},
+};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -37,6 +40,7 @@ pub(crate) enum ICaptureEvent {
     /// either the remote client leaving its device region,
     /// a new device entering the screen or the release bind.
     ClientEntered(u64),
+    ClipboardText(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +65,11 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// update the cached local clipboard and optionally send it now
+    SetClipboard {
+        text: Option<String>,
+        broadcast: bool,
+    },
 }
 
 impl Capture {
@@ -69,6 +78,7 @@ impl Capture {
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
     ) -> Self {
+        observability::start_reporter();
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
@@ -82,6 +92,8 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            switch_started_at: None,
+            clipboard_text: None,
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -137,6 +149,12 @@ impl Capture {
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
+
+    pub(crate) fn set_clipboard(&self, text: Option<String>, broadcast: bool) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::SetClipboard { text, broadcast });
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -166,6 +184,8 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    switch_started_at: Option<Timestamp>,
+    clipboard_text: Option<String>,
 }
 
 impl CaptureTask {
@@ -199,6 +219,16 @@ impl CaptureTask {
             .2
     }
 
+    fn set_state(&mut self, state: State, reason: &'static str) {
+        log::debug!(
+            target: "crossdesk::state",
+            "capture_state from={:?} to={state:?} reason={reason} client={:?}",
+            self.state,
+            self.active_client,
+        );
+        self.state = state;
+    }
+
     async fn run(mut self) {
         loop {
             if let Err(e) = self.do_capture().await {
@@ -213,6 +243,9 @@ impl CaptureTask {
                         CaptureRequest::Release => { /* nothing to do */ }
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
+                        }
+                        CaptureRequest::SetClipboard { text, .. } => {
+                            self.clipboard_text = text;
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -271,19 +304,29 @@ impl CaptureTask {
                     None => return Ok(()),
                 },
                 (handle, event) = self.conn.recv() => {
-                    if let Some(active) = self.active_client {
-                        if handle != active {
-                            // we only care about events coming from the client we are currently connected to
-                            // only `Ack` and `Leave` are relevant
-                            continue
+                    let event = match event {
+                        WireEvent::Protocol(event) => event,
+                        WireEvent::ClipboardText(text) => {
+                            self.event_tx
+                                .send(ICaptureEvent::ClipboardText(text))
+                                .expect("channel closed");
+                            continue;
                         }
-                    }
+                    };
 
+                    if self.active_client.is_some_and(|active| handle != active) {
+                        // Only Ack and Leave from the current input target are relevant.
+                        continue;
+                    }
                     match event {
                         // connection acknowlegded => set state to Sending
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
-                            self.state = State::Sending;
+                            self.set_state(State::Sending, "enter_acknowledged");
+                            if let Some(started_at) = self.switch_started_at.take() {
+                                observability::record_switch_ack(started_at);
+                            }
+                            self.send_clipboard_to(handle).await;
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
@@ -307,6 +350,14 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
+                    CaptureRequest::SetClipboard { text, broadcast } => {
+                        self.clipboard_text = text;
+                        if broadcast {
+                            if let Some(text) = self.clipboard_text.as_deref() {
+                                self.conn.broadcast_clipboard(text).await;
+                            }
+                        }
+                    }
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -319,7 +370,9 @@ impl CaptureTask {
         capture: &mut InputCapture,
         event: (CaptureHandle, CaptureEvent),
     ) -> Result<(), CaptureError> {
+        let captured_at = Timestamp::now();
         let (handle, event) = event;
+        let is_input = matches!(event, CaptureEvent::Input(_));
         log::trace!("({handle}): {event:?}");
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
@@ -347,8 +400,9 @@ impl CaptureTask {
 
         // activated a new client
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
-            self.state = State::WaitingForAck;
             self.active_client.replace(handle);
+            self.switch_started_at = Some(Timestamp::now());
+            self.set_state(State::WaitingForAck, "edge_entered");
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
                 .expect("channel closed");
@@ -365,15 +419,24 @@ impl CaptureTask {
             },
         };
 
-        if let Err(e) = self.conn.send(event, handle).await {
-            const DUR: Duration = Duration::from_millis(500);
-            debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            capture.release().await?;
+        match self.conn.send(event, handle).await {
+            Ok(()) => {
+                if is_input {
+                    observability::record_capture_to_send(captured_at);
+                }
+            }
+            Err(e) => {
+                const DUR: Duration = Duration::from_millis(500);
+                debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+                self.switch_started_at = None;
+                capture.release().await?;
+            }
         }
         Ok(())
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        self.switch_started_at = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Synthesize key-up events for every key still held in the
@@ -417,6 +480,15 @@ impl CaptureTask {
             }
         }
         capture.release().await
+    }
+
+    async fn send_clipboard_to(&self, handle: CaptureHandle) {
+        let Some(text) = self.clipboard_text.as_deref() else {
+            return;
+        };
+        if let Err(error) = self.conn.send_clipboard(text, handle).await {
+            log::debug!("clipboard text was not sent to client {handle}: {error}");
+        }
     }
 }
 

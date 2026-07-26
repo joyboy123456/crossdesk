@@ -68,6 +68,7 @@ windows = { version = "0.61.2", features = [
 
 [features]
 default = ["layer_shell", "x11", "libei"]
+metrics = []
 layer_shell = [
     "dep:wayland-client",
     "dep:wayland-protocols",

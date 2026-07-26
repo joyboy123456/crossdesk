@@ -66,6 +66,7 @@ struct ConfigToml {
     emulation_backend: Option<EmulationBackend>,
     port: Option<u16>,
     release_bind: Option<Vec<scancode::Linux>>,
+    clipboard_sync: Option<bool>,
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
@@ -494,6 +495,14 @@ impl Config {
             .unwrap_or(Vec::from_iter(DEFAULT_RELEASE_KEYS.iter().cloned()))
     }
 
+    /// whether UTF-8 text clipboard synchronization is enabled
+    pub fn clipboard_sync(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|config| config.clipboard_sync)
+            .unwrap_or(true)
+    }
+
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
         if clients.is_empty() {
@@ -504,6 +513,14 @@ impl Config {
         }
         self.config_toml.as_mut().expect("config").clients =
             Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
+    }
+
+    /// enable or disable text clipboard synchronization
+    pub fn set_clipboard_sync(&mut self, enabled: bool) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        self.config_toml.as_mut().expect("config").clipboard_sync = Some(enabled);
     }
 
     /// set authorized keys
@@ -518,7 +535,7 @@ impl Config {
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {
-        log::info!("reading config from {:?}", &self.config_path);
+        log::info!("reading config from {:?}", self.config_path);
 
         let current_config = fs::read_to_string(&self.config_path)?;
         let current_config = match current_config.parse::<DocumentMut>() {
@@ -548,7 +565,7 @@ impl Config {
     }
 
     pub fn write_back(&mut self) -> Result<(), io::Error> {
-        log::info!("writing config to {:?}", &self.config_path);
+        log::info!("writing config to {:?}", self.config_path);
         /* the new config */
         let new_config = self.config_toml.clone().unwrap_or_default();
         let new_config = toml_edit::ser::to_string_pretty(&new_config).expect("config");

@@ -357,6 +357,8 @@ fn get_events(
             })))
         }
         CGEventType::ScrollWheel => {
+            // CoreGraphics uses the opposite scroll sign from the protocol's
+            // wl_pointer/libei convention (positive = down/right).
             if ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS) != 0 {
                 let v =
                     ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
@@ -366,14 +368,14 @@ fn get_events(
                     result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
                         time: 0,
                         axis: 0, // Vertical
-                        value: v as f64,
+                        value: -v as f64,
                     })));
                 }
                 if h != 0 {
                     result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
                         time: 0,
                         axis: 1, // Horizontal
-                        value: h as f64,
+                        value: -h as f64,
                     })));
                 }
             } else {
@@ -386,7 +388,7 @@ fn get_events(
                     result.push(CaptureEvent::Input(Event::Pointer(
                         PointerEvent::AxisDiscrete120 {
                             axis: 0, // Vertical
-                            value: V120_STEPS_PER_LINE * v as i32,
+                            value: -V120_STEPS_PER_LINE * v as i32,
                         },
                     )));
                 }
@@ -394,7 +396,7 @@ fn get_events(
                     result.push(CaptureEvent::Input(Event::Pointer(
                         PointerEvent::AxisDiscrete120 {
                             axis: 1, // Horizontal
-                            value: V120_STEPS_PER_LINE * h as i32,
+                            value: -V120_STEPS_PER_LINE * h as i32,
                         },
                     )));
                 }
@@ -533,7 +535,18 @@ fn create_event_tap<'a>(
             res_events.iter().for_each(|e| {
                 // error must be ignored, since the event channel
                 // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, *e));
+                #[cfg(feature = "metrics")]
+                let kind = crate::observability::event_kind(e);
+                let _result = event_tx.blocking_send((pos, *e));
+                #[cfg(feature = "metrics")]
+                if _result.is_ok() {
+                    const EVENT_CHANNEL_CAPACITY: usize = 32;
+                    crate::observability::record_enqueued(
+                        "macos_capture",
+                        kind,
+                        EVENT_CHANNEL_CAPACITY.saturating_sub(event_tx.capacity()),
+                    );
+                }
             });
             // Returning Drop should stop the event from being processed
             // but core fundation still returns the event
@@ -792,7 +805,11 @@ impl Stream for MacOSInputCapture {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match ready!(self.event_rx.poll_recv(cx)) {
             None => Poll::Ready(None),
-            Some(e) => Poll::Ready(Some(Ok(e))),
+            Some(e) => {
+                #[cfg(feature = "metrics")]
+                crate::observability::record_dequeued("macos_capture", self.event_rx.len());
+                Poll::Ready(Some(Ok(e)))
+            }
         }
     }
 }

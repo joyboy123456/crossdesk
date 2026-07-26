@@ -1,9 +1,12 @@
-use crate::config::local_commit;
-use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
+use crate::{
+    config::local_commit,
+    listen::{LanMouseListener, ListenEvent, ListenerCreationError},
+    observability::{self, Timestamp},
+};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
-use lan_mouse_proto::{Position, ProtoEvent};
+use lan_mouse_proto::{CAPABILITY_CLIPBOARD_TEXT, Position, ProtoEvent, WireEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
@@ -64,12 +67,17 @@ pub(crate) enum EmulationEvent {
         addr: SocketAddr,
         commit: [u8; 8],
     },
+    ClipboardText(String),
 }
 
 enum EmulationRequest {
     Reenable,
     Release(SocketAddr),
     ChangePort(u16),
+    SetClipboard {
+        text: Option<String>,
+        broadcast: bool,
+    },
     Terminate,
 }
 
@@ -86,6 +94,7 @@ impl Emulation {
             emulation_proxy,
             request_rx,
             event_tx,
+            clipboard_text: None,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -113,6 +122,12 @@ impl Emulation {
             .expect("channel closed")
     }
 
+    pub(crate) fn set_clipboard(&self, text: Option<String>, broadcast: bool) {
+        self.request_tx
+            .send(EmulationRequest::SetClipboard { text, broadcast })
+            .expect("channel closed");
+    }
+
     pub(crate) async fn event(&mut self) -> EmulationEvent {
         self.event_rx.recv().await.expect("channel closed")
     }
@@ -134,6 +149,7 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    clipboard_text: Option<String>,
 }
 
 impl ListenTask {
@@ -144,40 +160,47 @@ impl ListenTask {
         loop {
             select! {
                 e = self.listener.next() => {match e {
-                    Some(ListenEvent::Msg { event, addr }) => {
-                        log::trace!("{event} <-<-<-<-<- {addr}");
+                    Some(ListenEvent::Msg { event, addr, received_at }) => {
                         last_response.insert(addr, Instant::now());
                         match event {
-                            ProtoEvent::Enter(pos) => {
-                                if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
-                                    log::info!("releasing capture: {addr} entered this device");
-                                    self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
-                                    self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                            WireEvent::ClipboardText(text) => {
+                                self.event_tx
+                                    .send(EmulationEvent::ClipboardText(text))
+                                    .expect("channel closed");
+                            }
+                            WireEvent::Protocol(event) => {
+                                log::trace!("{event} <-<-<-<-<- {addr}");
+                                match event {
+                                    ProtoEvent::Enter(pos) => {
+                                        if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                                            log::info!("releasing capture: {addr} entered this device");
+                                            self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                            self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                            self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                                        }
+                                    }
+                                    ProtoEvent::Leave(_) => {
+                                        self.emulation_proxy.remove(addr);
+                                        self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                    }
+                                    ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr, received_at),
+                                    ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
+                                    ProtoEvent::Hello { commit, capabilities } => {
+                                        self.listener.set_peer_capabilities(addr, capabilities);
+                                        self.listener.reply(addr, ProtoEvent::Hello {
+                                            commit: local_commit(),
+                                            capabilities: CAPABILITY_CLIPBOARD_TEXT,
+                                        }).await;
+                                        if capabilities & CAPABILITY_CLIPBOARD_TEXT != 0 {
+                                            if let Some(text) = self.clipboard_text.as_deref() {
+                                                self.listener.send_clipboard(addr, text).await;
+                                            }
+                                        }
+                                        self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                                    }
+                                    _ => {}
                                 }
                             }
-                            ProtoEvent::Leave(_) => {
-                                self.emulation_proxy.remove(addr);
-                                self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                            }
-                            ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
-                            ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
-                            // Peer's version handshake. Echo our own
-                            // commit back so the peer's connect-side
-                            // receive_loop populates its `peer_commit`,
-                            // AND publish a PeerHello upward so our
-                            // service can populate ours from the listen
-                            // side too — the connect side is the primary
-                            // path, but if the outbound direction is
-                            // broken (one-way setup, NAT, peer's TCP
-                            // listener down) the version display would
-                            // otherwise silently say "unknown" while
-                            // the peer is in fact happily talking to us.
-                            ProtoEvent::Hello { commit } => {
-                                self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
-                                self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
-                            }
-                            _ => {}
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
@@ -203,6 +226,14 @@ impl ListenTask {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
                         self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
+                    }
+                    EmulationRequest::SetClipboard { text, broadcast } => {
+                        self.clipboard_text = text;
+                        if broadcast {
+                            if let Some(text) = self.clipboard_text.as_deref() {
+                                self.listener.broadcast_clipboard(text).await;
+                            }
+                        }
                     }
                     EmulationRequest::Terminate => break,
                 },
@@ -236,10 +267,18 @@ pub(crate) struct EmulationProxy {
 }
 
 enum ProxyRequest {
-    Input(Event, SocketAddr),
+    Input(Event, SocketAddr, Timestamp),
     Remove(SocketAddr),
     Terminate,
     Reenable,
+}
+
+impl ProxyRequest {
+    fn record_dequeued(&self) {
+        if matches!(self, Self::Input(..)) {
+            observability::injection_queue_pop();
+        }
+    }
 }
 
 impl EmulationProxy {
@@ -277,12 +316,15 @@ impl EmulationProxy {
         event
     }
 
-    fn consume(&self, event: Event, addr: SocketAddr) {
+    fn consume(&self, event: Event, addr: SocketAddr, received_at: Timestamp) {
         // ignore events if emulation is currently disabled
         if self.emulation_active.get() {
+            observability::injection_queue_push();
             self.request_tx
-                .send(ProxyRequest::Input(event, addr))
+                .send(ProxyRequest::Input(event, addr, received_at))
                 .expect("channel closed");
+        } else {
+            observability::record_emulation_inactive_drop(&event);
         }
     }
 
@@ -327,10 +369,14 @@ impl EmulationTask {
             }
             // wait for reenable request
             loop {
-                match self.request_rx.recv().await.expect("channel closed") {
+                let request = self.request_rx.recv().await.expect("channel closed");
+                request.record_dequeued();
+                match request {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
-                    ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Input(event, ..) => {
+                        observability::record_emulation_inactive_drop(&event);
+                    }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
@@ -383,8 +429,11 @@ impl EmulationTask {
     ) -> Result<(), InputEmulationError> {
         loop {
             tokio::select! {
-                e = self.request_rx.recv() => match e.expect("channel closed") {
-                    ProxyRequest::Input(event, addr) => {
+                e = self.request_rx.recv() => {
+                    let request = e.expect("channel closed");
+                    request.record_dequeued();
+                    match request {
+                    ProxyRequest::Input(event, addr, received_at) => {
                         let handle = match self.handles.get(&addr) {
                             Some(&handle) => handle,
                             None => {
@@ -395,7 +444,9 @@ impl EmulationTask {
                                 handle
                             }
                         };
-                        emulation.consume(event, handle).await?;
+                        let result = emulation.consume(event, handle).await;
+                        observability::record_receive_to_inject(received_at);
+                        result?;
                     },
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
@@ -404,7 +455,7 @@ impl EmulationTask {
                     }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
-                },
+                }},
             }
         }
     }
@@ -421,9 +472,13 @@ fn to_ipc_pos(pos: Position) -> lan_mouse_ipc::Position {
 
 async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
     loop {
-        match rx.recv().await.expect("channel closed") {
+        let request = rx.recv().await.expect("channel closed");
+        request.record_dequeued();
+        match request {
             ProxyRequest::Terminate => return,
-            ProxyRequest::Input(_, _) => continue,
+            ProxyRequest::Input(event, ..) => {
+                observability::record_emulation_inactive_drop(&event);
+            }
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
         }

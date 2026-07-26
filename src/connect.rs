@@ -1,7 +1,13 @@
-use crate::client::ClientManager;
-use crate::config::local_commit;
+use crate::{
+    client::ClientManager,
+    config::local_commit,
+    observability::{self, Timestamp},
+};
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{
+    CAPABILITY_CLIPBOARD_TEXT, MAX_EVENT_SIZE, MAX_WIRE_SIZE, ProtoEvent, ProtocolError, WireEvent,
+    decode_wire_event, encode_clipboard_text,
+};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::RefCell,
@@ -12,6 +18,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+#[cfg(feature = "metrics")]
+use std::{collections::VecDeque, time::Instant};
 use thiserror::Error;
 use tokio::{
     net::UdpSocket,
@@ -37,11 +45,50 @@ pub(crate) enum LanMouseConnectionError {
     NotConnected,
     #[error("emulation is disabled on the target device")]
     TargetEmulationDisabled,
+    #[error("clipboard synchronization is not supported by the target device")]
+    ClipboardUnsupported,
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
     #[error("Connection timed out")]
     Timeout,
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct PingState {
+    responses: HashSet<SocketAddr>,
+    #[cfg(feature = "metrics")]
+    outstanding: HashMap<SocketAddr, VecDeque<Instant>>,
+}
+
+impl PingState {
+    fn sent(&mut self, _addr: SocketAddr) {
+        #[cfg(feature = "metrics")]
+        self.outstanding
+            .entry(_addr)
+            .or_default()
+            .push_back(Instant::now());
+    }
+
+    fn response(&mut self, addr: SocketAddr) {
+        self.responses.insert(addr);
+        #[cfg(feature = "metrics")]
+        if let Some(sent_at) = self
+            .outstanding
+            .get_mut(&addr)
+            .and_then(VecDeque::pop_front)
+        {
+            observability::record_rtt(sent_at.elapsed());
+        }
+    }
+
+    fn take_response(&mut self, addr: SocketAddr) -> bool {
+        #[cfg(feature = "metrics")]
+        self.outstanding.remove(&addr);
+        self.responses.remove(&addr)
+    }
+}
 
 async fn connect(
     addr: SocketAddr,
@@ -97,9 +144,19 @@ pub(crate) struct LanMouseConnection {
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    recv_rx: Receiver<(ClientHandle, WireEvent)>,
+    recv_tx: Sender<(ClientHandle, WireEvent)>,
+    ping_state: Rc<RefCell<PingState>>,
+    peer_capabilities: Rc<RefCell<HashMap<SocketAddr, u32>>>,
+}
+
+#[derive(Clone)]
+struct ConnectionContext {
+    client_manager: ClientManager,
+    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
+    recv_tx: Sender<(ClientHandle, WireEvent)>,
+    ping_state: Rc<RefCell<PingState>>,
+    peer_capabilities: Rc<RefCell<HashMap<SocketAddr, u32>>>,
 }
 
 impl LanMouseConnection {
@@ -112,11 +169,12 @@ impl LanMouseConnection {
             connecting: Default::default(),
             recv_rx,
             recv_tx,
-            ping_response: Default::default(),
+            ping_state: Default::default(),
+            peer_capabilities: Default::default(),
         }
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
+    pub(crate) async fn recv(&mut self) -> (ClientHandle, WireEvent) {
         self.recv_rx.recv().await.expect("channel closed")
     }
 
@@ -125,7 +183,9 @@ impl LanMouseConnection {
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
+        let serialization_started = Timestamp::now();
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        observability::record_serialization(serialization_started);
         let buf = &buf[..len];
         if let Some(addr) = self.client_manager.active_addr(handle) {
             let conn = {
@@ -137,10 +197,17 @@ impl LanMouseConnection {
                     return Err(LanMouseConnectionError::TargetEmulationDisabled);
                 }
                 match conn.send(buf).await {
-                    Ok(_) => {}
+                    Ok(_) => observability::record_sent(&event),
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        disconnect(
+                            &self.client_manager,
+                            handle,
+                            addr,
+                            &self.conns,
+                            &self.peer_capabilities,
+                        )
+                        .await;
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -154,32 +221,112 @@ impl LanMouseConnection {
             connecting.insert(handle);
             // connect in the background
             spawn_local(connect_to_handle(
-                self.client_manager.clone(),
                 self.cert.clone(),
                 handle,
-                self.conns.clone(),
                 self.connecting.clone(),
-                self.recv_tx.clone(),
-                self.ping_response.clone(),
+                ConnectionContext {
+                    client_manager: self.client_manager.clone(),
+                    conns: self.conns.clone(),
+                    recv_tx: self.recv_tx.clone(),
+                    ping_state: self.ping_state.clone(),
+                    peer_capabilities: self.peer_capabilities.clone(),
+                },
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
     }
+
+    pub(crate) async fn send_clipboard(
+        &self,
+        text: &str,
+        handle: ClientHandle,
+    ) -> Result<(), LanMouseConnectionError> {
+        let Some(addr) = self.client_manager.active_addr(handle) else {
+            return Err(LanMouseConnectionError::NotConnected);
+        };
+        if self
+            .peer_capabilities
+            .borrow()
+            .get(&addr)
+            .is_none_or(|capabilities| capabilities & CAPABILITY_CLIPBOARD_TEXT == 0)
+        {
+            return Err(LanMouseConnectionError::ClipboardUnsupported);
+        }
+        let conn = {
+            let conns = self.conns.lock().await;
+            conns.get(&addr).cloned()
+        }
+        .ok_or(LanMouseConnectionError::NotConnected)?;
+        let packet = encode_clipboard_text(text)?;
+        if let Err(error) = conn.send(&packet).await {
+            log::warn!("client {handle} failed to send clipboard text: {error}");
+            disconnect(
+                &self.client_manager,
+                handle,
+                addr,
+                &self.conns,
+                &self.peer_capabilities,
+            )
+            .await;
+            return Err(error.into());
+        }
+        log::debug!("sent clipboard text to {addr} ({} bytes)", text.len());
+        Ok(())
+    }
+
+    pub(crate) async fn broadcast_clipboard(&self, text: &str) {
+        let packet = match encode_clipboard_text(text) {
+            Ok(packet) => packet,
+            Err(error) => {
+                log::warn!("clipboard text was not broadcast: {error}");
+                return;
+            }
+        };
+        let capable = self.peer_capabilities.borrow().clone();
+        let conns = {
+            let conns = self.conns.lock().await;
+            conns
+                .iter()
+                .map(|(addr, conn)| (*addr, conn.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (addr, conn) in conns {
+            if !capable
+                .get(&addr)
+                .is_some_and(|capabilities| capabilities & CAPABILITY_CLIPBOARD_TEXT != 0)
+            {
+                continue;
+            }
+            if let Err(error) = conn.send(&packet).await {
+                log::warn!("failed to send clipboard text to {addr}: {error}");
+                if let Some(handle) = self.client_manager.get_client(addr) {
+                    disconnect(
+                        &self.client_manager,
+                        handle,
+                        addr,
+                        &self.conns,
+                        &self.peer_capabilities,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
 }
 
 async fn connect_to_handle(
-    client_manager: ClientManager,
     cert: Certificate,
     handle: ClientHandle,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    context: ConnectionContext,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     // sending did not work, figure out active conn.
-    if let Some(addrs) = client_manager.get_ips(handle) {
-        let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
+    if let Some(addrs) = context.client_manager.get_ips(handle) {
+        let port = context
+            .client_manager
+            .get_port(handle)
+            .unwrap_or(DEFAULT_PORT);
         let addrs = addrs
             .into_iter()
             .map(|a| SocketAddr::new(a, port))
@@ -194,8 +341,8 @@ async fn connect_to_handle(
             }
         };
         log::info!("client ({handle}) connected @ {addr}");
-        client_manager.set_active_addr(handle, Some(addr));
-        conns.lock().await.insert(addr, conn.clone());
+        context.client_manager.set_active_addr(handle, Some(addr));
+        context.conns.lock().await.insert(addr, conn.clone());
         connecting.lock().await.remove(&handle);
 
         // Best-effort version handshake. Send our commit hash once
@@ -205,6 +352,7 @@ async fn connect_to_handle(
         // per the forward-compat handler in [`receive_loop`].
         let (buf, len) = ProtoEvent::Hello {
             commit: local_commit(),
+            capabilities: CAPABILITY_CLIPBOARD_TEXT,
         }
         .into();
         if let Err(e) = conn.send(&buf[..len]).await {
@@ -212,18 +360,10 @@ async fn connect_to_handle(
         }
 
         // poll connection for active
-        spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
+        spawn_local(ping_pong(addr, conn.clone(), context.ping_state.clone()));
 
         // receiver
-        spawn_local(receive_loop(
-            client_manager,
-            handle,
-            addr,
-            conn,
-            conns,
-            tx,
-            ping_response.clone(),
-        ));
+        spawn_local(receive_loop(handle, addr, conn, context));
         return Ok(());
     }
     connecting.lock().await.remove(&handle);
@@ -233,7 +373,7 @@ async fn connect_to_handle(
 async fn ping_pong(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    ping_state: Rc<RefCell<PingState>>,
 ) {
     loop {
         let (buf, len) = ProtoEvent::Ping.into();
@@ -245,12 +385,13 @@ async fn ping_pong(
                 let _ = conn.close().await;
                 break;
             }
+            ping_state.borrow_mut().sent(addr);
             log::trace!("PING >->->->->- {addr}");
 
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        if !ping_response.borrow_mut().remove(&addr) {
+        if !ping_state.borrow_mut().take_response(addr) {
             log::warn!("{addr} did not respond, closing connection");
             let _ = conn.close().await;
             return;
@@ -259,31 +400,42 @@ async fn ping_pong(
 }
 
 async fn receive_loop(
-    client_manager: ClientManager,
     handle: ClientHandle,
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    context: ConnectionContext,
 ) {
-    let mut buf = [0u8; MAX_EVENT_SIZE];
-    while conn.recv(&mut buf).await.is_ok() {
-        match buf.try_into() {
-            Ok(event) => {
+    let mut buf = vec![0u8; MAX_WIRE_SIZE];
+    while let Ok(len) = conn.recv(&mut buf).await {
+        match decode_wire_event(&buf[..len]) {
+            Ok(WireEvent::Protocol(event)) => {
                 log::trace!("{addr} <==<==<== {event}");
                 match event {
                     ProtoEvent::Pong(b) => {
-                        client_manager.set_active_addr(handle, Some(addr));
-                        client_manager.set_alive(handle, b);
-                        ping_response.borrow_mut().insert(addr);
+                        context.client_manager.set_active_addr(handle, Some(addr));
+                        context.client_manager.set_alive(handle, b);
+                        context.ping_state.borrow_mut().response(addr);
                     }
-                    ProtoEvent::Hello { commit } => {
-                        client_manager.set_peer_commit(handle, Some(commit));
+                    ProtoEvent::Hello {
+                        commit,
+                        capabilities,
+                    } => {
+                        context.client_manager.set_peer_commit(handle, Some(commit));
+                        context
+                            .peer_capabilities
+                            .borrow_mut()
+                            .insert(addr, capabilities);
                     }
-                    event => tx.send((handle, event)).expect("channel closed"),
+                    event => context
+                        .recv_tx
+                        .send((handle, WireEvent::Protocol(event)))
+                        .expect("channel closed"),
                 }
             }
+            Ok(event @ WireEvent::ClipboardText(_)) => context
+                .recv_tx
+                .send((handle, event))
+                .expect("channel closed"),
             // Skip undecodable datagrams without dropping the
             // connection. Each DTLS recv is one framed message, so
             // skipping is safe and keeps us forward-compatible with
@@ -292,7 +444,14 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    disconnect(
+        &context.client_manager,
+        handle,
+        addr,
+        &context.conns,
+        &context.peer_capabilities,
+    )
+    .await;
 }
 
 async fn disconnect(
@@ -300,11 +459,13 @@ async fn disconnect(
     handle: ClientHandle,
     addr: SocketAddr,
     conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
+    peer_capabilities: &RefCell<HashMap<SocketAddr, u32>>,
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
     conns.lock().await.remove(&addr);
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
+    peer_capabilities.borrow_mut().remove(&addr);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }

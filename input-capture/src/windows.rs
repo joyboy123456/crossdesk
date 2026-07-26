@@ -12,6 +12,8 @@ use super::{Capture, CaptureError, CaptureEvent, Position};
 mod display_util;
 mod event_thread;
 
+const EVENT_CHANNEL_CAPACITY: usize = 10;
+
 pub struct WindowsInputCapture {
     event_rx: Receiver<(Position, CaptureEvent)>,
     event_thread: EventThread,
@@ -41,7 +43,7 @@ impl Capture for WindowsInputCapture {
 
 impl WindowsInputCapture {
     pub(crate) fn new() -> Self {
-        let (event_tx, event_rx) = channel(10);
+        let (event_tx, event_rx) = channel(EVENT_CHANNEL_CAPACITY);
         let event_thread = EventThread::new(event_tx);
         Self {
             event_thread,
@@ -55,7 +57,11 @@ impl Stream for WindowsInputCapture {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match ready!(self.event_rx.poll_recv(cx)) {
             None => Poll::Ready(None),
-            Some(e) => Poll::Ready(Some(Ok(e))),
+            Some(e) => {
+                #[cfg(feature = "metrics")]
+                crate::observability::record_dequeued("windows_capture", self.event_rx.len());
+                Poll::Ready(Some(Ok(e)))
+            }
         }
     }
 }

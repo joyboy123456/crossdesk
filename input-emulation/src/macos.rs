@@ -28,6 +28,13 @@ const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Convert the protocol's scroll convention (positive = down/right) to
+/// CoreGraphics' opposite convention. HID-posted events are not affected by
+/// the receiver's natural-scrolling preference.
+fn wire_scroll_to_cgevent(value: i32) -> i32 {
+    value.saturating_neg()
+}
+
 pub(crate) struct MacOSEmulation {
     /// global event source for all events
     event_source: CGEventSource,
@@ -420,7 +427,7 @@ impl Emulation for MacOSEmulation {
                         axis,
                         value,
                     } => {
-                        let value = value as i32;
+                        let value = wire_scroll_to_cgevent(value as i32);
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value, 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value, 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
@@ -447,6 +454,7 @@ impl Emulation for MacOSEmulation {
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         const LINES_PER_STEP: i32 = 3;
+                        let value = wire_scroll_to_cgevent(value);
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value / (120 / LINES_PER_STEP), 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value / (120 / LINES_PER_STEP), 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
@@ -598,5 +606,18 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wire_scroll_to_cgevent;
+
+    #[test]
+    fn converts_wire_scroll_direction_to_core_graphics() {
+        assert_eq!(wire_scroll_to_cgevent(120), -120);
+        assert_eq!(wire_scroll_to_cgevent(-120), 120);
+        assert_eq!(wire_scroll_to_cgevent(0), 0);
+        assert_eq!(wire_scroll_to_cgevent(i32::MIN), i32::MAX);
     }
 }

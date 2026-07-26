@@ -208,6 +208,8 @@ pub enum FrontendEvent {
     AuthorizedUpdated(HashMap<String, String>),
     /// public key fingerprint of this device
     PublicKeyFingerprint(String),
+    /// text clipboard synchronization state and platform availability
+    ClipboardState { enabled: bool, available: bool },
     /// new device connected
     DeviceConnected {
         addr: SocketAddr,
@@ -231,6 +233,8 @@ pub enum FrontendRequest {
     Activate(ClientHandle, bool),
     /// add a new client
     Create,
+    /// add a fully configured client
+    CreateConfigured { config: ClientConfig, active: bool },
     /// change the listen port (recreate udp listener)
     ChangePort(u16),
     /// remove a client
@@ -251,6 +255,8 @@ pub enum FrontendRequest {
     EnableCapture,
     /// request reenabling input emulation
     EnableEmulation,
+    /// enable or disable UTF-8 text clipboard synchronization
+    SetClipboardSync(bool),
     /// synchronize all state
     Sync,
     /// authorize fingerprint (description, fingerprint)
@@ -261,6 +267,8 @@ pub enum FrontendRequest {
     UpdateEnterHook(u64, Option<String>),
     /// save config file
     SaveConfiguration,
+    /// gracefully stop the service
+    ShutdownService,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -268,6 +276,48 @@ pub enum Status {
     #[default]
     Disabled,
     Enabled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientConfig, FrontendRequest, Position};
+
+    #[test]
+    fn configured_client_request_round_trips_as_json() {
+        let request = FrontendRequest::CreateConfigured {
+            config: ClientConfig {
+                hostname: Some("mac-mini.local".into()),
+                fix_ips: vec!["192.168.1.42".parse().expect("valid test address")],
+                port: 4242,
+                pos: Position::Right,
+                cmd: None,
+            },
+            active: true,
+        };
+
+        let json = serde_json::to_string(&request).expect("serialize request");
+        let decoded = serde_json::from_str(&json).expect("deserialize request");
+
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn shutdown_request_round_trips_as_json() {
+        let request = FrontendRequest::ShutdownService;
+        let json = serde_json::to_string(&request).expect("serialize request");
+        let decoded = serde_json::from_str(&json).expect("deserialize request");
+
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn clipboard_setting_request_round_trips_as_json() {
+        let request = FrontendRequest::SetClipboardSync(false);
+        let json = serde_json::to_string(&request).expect("serialize request");
+        let decoded = serde_json::from_str(&json).expect("deserialize request");
+
+        assert_eq!(request, decoded);
+    }
 }
 
 impl From<Status> for bool {

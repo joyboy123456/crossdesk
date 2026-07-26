@@ -1,6 +1,7 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
+    clipboard::{ClipboardEvent, ClipboardSync},
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     crypto,
@@ -13,6 +14,7 @@ use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
     IpcListenerCreationError, Position, Status,
 };
+use lan_mouse_proto::MAX_CLIPBOARD_TEXT_SIZE;
 use log;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -67,6 +69,11 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    shutdown_requested: bool,
+    clipboard: ClipboardSync,
+    clipboard_enabled: bool,
+    clipboard_available: bool,
+    clipboard_text: Option<String>,
 }
 
 #[derive(Debug)]
@@ -106,6 +113,8 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+        let clipboard_enabled = config.clipboard_sync();
+        let clipboard = ClipboardSync::new(clipboard_enabled);
         let service = Self {
             config,
             capture,
@@ -123,6 +132,11 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            shutdown_requested: false,
+            clipboard,
+            clipboard_enabled,
+            clipboard_available: false,
+            clipboard_text: None,
         };
         Ok(service)
     }
@@ -140,15 +154,23 @@ impl Service {
             self.activate_client(handle);
         }
 
-        loop {
+        while !self.shutdown_requested {
             tokio::select! {
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                event = self.clipboard.event() => {
+                    if let Some(event) = event {
+                        self.handle_clipboard_event(event);
+                    }
+                },
                 _ = self.config.changed() => self.handle_config_change(),
-                r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
+                r = signal::ctrl_c() => {
+                    r.expect("failed to wait for CTRL+C");
+                    self.shutdown_requested = true;
+                },
             }
         }
 
@@ -159,6 +181,8 @@ impl Service {
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        log::debug!("terminating clipboard sync ...");
+        self.clipboard.terminate();
 
         Ok(())
     }
@@ -182,12 +206,20 @@ impl Service {
                 self.add_client();
                 self.save_config();
             }
+            FrontendRequest::CreateConfigured { config, active } => {
+                self.add_configured_client(config, active);
+                self.save_config();
+            }
             FrontendRequest::Delete(handle) => {
                 self.remove_client(handle);
                 self.save_config();
             }
             FrontendRequest::EnableCapture => self.capture.reenable(),
             FrontendRequest::EnableEmulation => self.emulation.reenable(),
+            FrontendRequest::SetClipboardSync(enabled) => {
+                self.set_clipboard_enabled(enabled);
+                self.save_config();
+            }
             FrontendRequest::Enumerate() => self.enumerate(),
             FrontendRequest::UpdateFixIps(handle, fix_ips) => {
                 self.update_fix_ips(handle, fix_ips);
@@ -215,6 +247,7 @@ impl Service {
                 self.update_enter_hook(handle, enter_hook)
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            FrontendRequest::ShutdownService => self.shutdown_requested = true,
         }
     }
 
@@ -260,6 +293,7 @@ impl Service {
             .write()
             .unwrap()
             .clone_from(&authorized_keys);
+        self.set_clipboard_enabled(self.config.clipboard_sync());
         self.sync_frontend();
     }
 
@@ -327,6 +361,7 @@ impl Service {
                     self.broadcast_client(handle);
                 }
             }
+            EmulationEvent::ClipboardText(text) => self.apply_remote_clipboard(text),
         }
     }
 
@@ -351,6 +386,7 @@ impl Service {
                 log::info!("entering client {handle} ...");
                 self.spawn_hook_command(handle);
             }
+            ICaptureEvent::ClipboardText(text) => self.apply_remote_clipboard(text),
         }
     }
 
@@ -387,6 +423,7 @@ impl Service {
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
         ));
+        self.notify_clipboard_state();
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
@@ -476,6 +513,16 @@ impl Service {
         log::info!("added client {handle}");
         let (c, s) = self.client_manager.get_state(handle).unwrap();
         self.notify_frontend(FrontendEvent::Created(handle, c, s));
+    }
+
+    fn add_configured_client(&mut self, config: lan_mouse_ipc::ClientConfig, active: bool) {
+        let handle = self.client_manager.add_configured_client(config, false);
+        log::info!("added configured client {handle}");
+        let (config, state) = self.client_manager.get_state(handle).expect("new client");
+        self.notify_frontend(FrontendEvent::Created(handle, config, state));
+        if active {
+            self.activate_client(handle);
+        }
     }
 
     fn set_client_active(&mut self, handle: ClientHandle, active: bool) {
@@ -605,6 +652,63 @@ impl Service {
                 }
                 Err(e) => log::warn!("{cmd}: {e}"),
             }
+        });
+    }
+
+    fn handle_clipboard_event(&mut self, event: ClipboardEvent) {
+        match event {
+            ClipboardEvent::Availability(available) => {
+                self.clipboard_available = available;
+                self.notify_clipboard_state();
+            }
+            ClipboardEvent::LocalText(text) => {
+                if !self.clipboard_enabled {
+                    return;
+                }
+                if text.len() > MAX_CLIPBOARD_TEXT_SIZE {
+                    log::warn!(
+                        "clipboard text was not synchronized: {} bytes exceeds the {} byte limit",
+                        text.len(),
+                        MAX_CLIPBOARD_TEXT_SIZE,
+                    );
+                    self.update_clipboard_cache(None, false);
+                    return;
+                }
+                self.update_clipboard_cache(Some(text), true);
+            }
+        }
+    }
+
+    fn apply_remote_clipboard(&mut self, text: String) {
+        if !self.clipboard_enabled || self.clipboard_text.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        log::debug!("applying remote clipboard text ({} bytes)", text.len());
+        if self.clipboard.apply(text.clone()) {
+            self.update_clipboard_cache(Some(text), false);
+        }
+    }
+
+    fn set_clipboard_enabled(&mut self, enabled: bool) {
+        self.clipboard_enabled = enabled;
+        self.config.set_clipboard_sync(enabled);
+        self.clipboard.set_enabled(enabled);
+        if !enabled {
+            self.update_clipboard_cache(None, false);
+        }
+        self.notify_clipboard_state();
+    }
+
+    fn update_clipboard_cache(&mut self, text: Option<String>, broadcast: bool) {
+        self.clipboard_text.clone_from(&text);
+        self.capture.set_clipboard(text.clone(), broadcast);
+        self.emulation.set_clipboard(text, broadcast);
+    }
+
+    fn notify_clipboard_state(&mut self) {
+        self.notify_frontend(FrontendEvent::ClipboardState {
+            enabled: self.clipboard_enabled,
+            available: self.clipboard_available,
         });
     }
 }
