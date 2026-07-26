@@ -92,6 +92,7 @@ impl Display for Backend {
 
 pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
+    backend: Backend,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
 }
@@ -115,9 +116,22 @@ impl InputEmulation {
         };
         Ok(Self {
             emulation,
+            backend,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
         })
+    }
+
+    /// The backend in use. [`Backend::Dummy`] means every event is discarded,
+    /// which happens when no real backend could be created (on macOS:
+    /// missing accessibility permissions).
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    /// whether this emulation can actually move the local cursor
+    pub fn can_emulate(&self) -> bool {
+        self.backend != Backend::Dummy
     }
 
     pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {

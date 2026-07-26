@@ -492,12 +492,25 @@ impl EmulationTask {
             _ = self.cancellation_token.cancelled() => return Ok(()),
         };
 
-        // used to send enabled and disabled events
-        let _emulation_guard = DropGuard::new(
-            self.event_tx.clone(),
-            EmulationEvent::EmulationEnabled,
-            EmulationEvent::EmulationDisabled,
-        );
+        // Used to send enabled and disabled events. A dummy backend accepts
+        // events and throws them away - reporting that as "enabled" would let
+        // a peer enter this device and capture its mouse against a black
+        // hole, with no way back because the local cursor never moves and so
+        // never reaches the return barrier.
+        let _emulation_guard = if emulation.can_emulate() {
+            Some(DropGuard::new(
+                self.event_tx.clone(),
+                EmulationEvent::EmulationEnabled,
+                EmulationEvent::EmulationDisabled,
+            ))
+        } else {
+            log::warn!(
+                "input emulation fell back to the {} backend and cannot move the cursor; \
+                 peers will not be allowed to enter this device",
+                emulation.backend()
+            );
+            None
+        };
 
         // create active handles
         if let Err(e) = self.create_clients(&mut emulation).await {
