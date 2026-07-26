@@ -3,11 +3,11 @@ use crate::{
     client::ClientManager,
     clipboard::{ClipboardEvent, ClipboardSync},
     config::{Config, ConfigClient},
-    connect::LanMouseConnection,
+    connect::Connection,
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
-    listen::{LanMouseListener, ListenerCreationError},
+    listen::{DtlsListener, ListenerCreationError},
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
@@ -15,7 +15,6 @@ use lan_mouse_ipc::{
     IpcListenerCreationError, Position, Status,
 };
 use lan_mouse_proto::MAX_CLIPBOARD_TEXT_SIZE;
-use log;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
@@ -100,8 +99,8 @@ impl Service {
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
         // listener + connection
         let listener =
-            LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+            DtlsListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
+        let conn = Connection::new(cert.clone(), client_manager.clone());
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());

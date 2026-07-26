@@ -1,6 +1,6 @@
 use crate::{
     config::local_commit,
-    listen::{LanMouseListener, ListenEvent, ListenerCreationError},
+    listen::{DtlsListener, ListenEvent, ListenerCreationError},
     observability::{self, Timestamp},
 };
 use futures::StreamExt;
@@ -82,10 +82,7 @@ enum EmulationRequest {
 }
 
 impl Emulation {
-    pub(crate) fn new(
-        backend: Option<input_emulation::Backend>,
-        listener: LanMouseListener,
-    ) -> Self {
+    pub(crate) fn new(backend: Option<input_emulation::Backend>, listener: DtlsListener) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -145,7 +142,7 @@ impl Emulation {
 }
 
 struct ListenTask {
-    listener: LanMouseListener,
+    listener: DtlsListener,
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,

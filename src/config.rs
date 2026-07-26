@@ -13,7 +13,6 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::{collections::HashSet, io};
 use thiserror::Error;
-use toml;
 use toml_edit::{self, DocumentMut};
 
 use lan_mouse_cli::CliArgs;

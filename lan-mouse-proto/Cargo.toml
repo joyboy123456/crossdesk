@@ -2,12 +2,12 @@
 name = "lan-mouse-proto"
 description = "network protocol for lan-mouse"
 version = "0.4.0"
-edition = "2021"
-license = "GPL-3.0-or-later"
-repository = "https://github.com/feschber/lan-mouse"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
-num_enum = "0.7.2"
-thiserror = "2.0.0"
-input-event = { path = "../input-event", version = "0.4.0" }
+num_enum = { workspace = true }
+thiserror = { workspace = true }
+input-event = { workspace = true }
 paste = "1.0"

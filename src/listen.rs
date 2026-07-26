@@ -56,7 +56,7 @@ pub(crate) enum ListenEvent {
     },
 }
 
-pub(crate) struct LanMouseListener {
+pub(crate) struct DtlsListener {
     listen_rx: Receiver<ListenEvent>,
     listen_tx: Sender<ListenEvent>,
     listen_task: JoinHandle<()>,
@@ -72,7 +72,7 @@ type VerifyPeerCertificateFn = Arc<
         + Sync,
 >;
 
-impl LanMouseListener {
+impl DtlsListener {
     pub(crate) async fn new(
         port: u16,
         cert: Certificate,
@@ -304,7 +304,7 @@ impl LanMouseListener {
     }
 }
 
-impl Stream for LanMouseListener {
+impl Stream for DtlsListener {
     type Item = ListenEvent;
 
     fn poll_next(

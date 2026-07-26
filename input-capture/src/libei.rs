@@ -42,7 +42,7 @@ use input_event::Event;
 use crate::CaptureEvent;
 
 use super::{
-    Capture as LanMouseInputCapture, Position,
+    Capture as PlatformInputCapture, Position,
     error::{CaptureError, LibeiCaptureCreationError},
 };
 
@@ -577,7 +577,7 @@ async fn handle_ei_event(
 }
 
 #[async_trait]
-impl LanMouseInputCapture for LibeiInputCapture {
+impl PlatformInputCapture for LibeiInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         let _ = self
             .notify_capture

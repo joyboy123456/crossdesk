@@ -23,7 +23,7 @@ use tokio::task::LocalSet;
 const SERVICE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Error)]
-pub enum LanMouseError {
+pub enum CrossDeskError {
     #[error(transparent)]
     Service(#[from] ServiceError),
     #[error(transparent)]
@@ -53,14 +53,14 @@ pub fn main() {
     }
 }
 
-pub fn run() -> Result<(), LanMouseError> {
+pub fn run() -> Result<(), CrossDeskError> {
     let config = Config::new()?;
     match config.command() {
         Some(Command::TestEmulation(args)) => run_async(emulation_test::run(config, args))?,
         Some(Command::TestCapture(args)) => run_async(capture_test::run(config, args))?,
         Some(Command::Cli(args)) => run_async(lan_mouse_cli::run(args))?,
         Some(Command::Daemon) => match run_async(run_service(config)) {
-            Err(LanMouseError::Service(ServiceError::IpcListen(
+            Err(CrossDeskError::Service(ServiceError::IpcListen(
                 IpcListenerCreationError::AlreadyRunning,
             ))) => log::info!("service already running"),
             result => result?,
@@ -72,7 +72,7 @@ pub fn run() -> Result<(), LanMouseError> {
 }
 
 #[cfg(feature = "gui")]
-fn run_default(_config: Config) -> Result<(), LanMouseError> {
+fn run_default(_config: Config) -> Result<(), CrossDeskError> {
     let mut service = start_service_if_needed()?;
     let result = crossdesk_ui::run(crate::config::local_commit(), service.is_some());
 
@@ -85,9 +85,9 @@ fn run_default(_config: Config) -> Result<(), LanMouseError> {
 }
 
 #[cfg(not(feature = "gui"))]
-fn run_default(config: Config) -> Result<(), LanMouseError> {
+fn run_default(config: Config) -> Result<(), CrossDeskError> {
     match run_async(run_service(config)) {
-        Err(LanMouseError::Service(ServiceError::IpcListen(
+        Err(CrossDeskError::Service(ServiceError::IpcListen(
             IpcListenerCreationError::AlreadyRunning,
         ))) => log::info!("service already running"),
         result => result?,
@@ -95,10 +95,10 @@ fn run_default(config: Config) -> Result<(), LanMouseError> {
     Ok(())
 }
 
-fn run_async<F, E>(future: F) -> Result<(), LanMouseError>
+fn run_async<F, E>(future: F) -> Result<(), CrossDeskError>
 where
     F: Future<Output = Result<(), E>>,
-    LanMouseError: From<E>,
+    CrossDeskError: From<E>,
 {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()

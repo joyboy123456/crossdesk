@@ -34,7 +34,7 @@ use webrtc_dtls::{
 use webrtc_util::Conn;
 
 #[derive(Debug, Error)]
-pub(crate) enum LanMouseConnectionError {
+pub(crate) enum ConnectionError {
     #[error(transparent)]
     Bind(#[from] io::Error),
     #[error(transparent)]
@@ -93,7 +93,7 @@ impl PingState {
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
-) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
+) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, ConnectionError)> {
     log::info!("connecting to {addr} ...");
     let conn = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
@@ -110,7 +110,7 @@ async fn connect(
     };
     let timeout = tokio::time::sleep(DEFAULT_CONNECTION_TIMEOUT);
     tokio::select! {
-        _ = timeout => Err((addr, LanMouseConnectionError::Timeout)),
+        _ = timeout => Err((addr, ConnectionError::Timeout)),
         result = DTLSConn::new(conn, config, true, None) => match result {
             Ok(dtls_conn) => Ok((Arc::new(dtls_conn), addr)),
             Err(e) => Err((addr, e.into())),
@@ -121,14 +121,14 @@ async fn connect(
 async fn connect_any(
     addrs: &[SocketAddr],
     cert: Certificate,
-) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), LanMouseConnectionError> {
+) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), ConnectionError> {
     let mut joinset = JoinSet::new();
     for &addr in addrs {
         joinset.spawn_local(connect(addr, cert.clone()));
     }
     loop {
         match joinset.join_next().await {
-            None => return Err(LanMouseConnectionError::NotConnected),
+            None => return Err(ConnectionError::NotConnected),
             Some(r) => match r.expect("join error") {
                 Ok(conn) => return Ok(conn),
                 Err((a, e)) => {
@@ -139,7 +139,7 @@ async fn connect_any(
     }
 }
 
-pub(crate) struct LanMouseConnection {
+pub(crate) struct Connection {
     cert: Certificate,
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
@@ -159,7 +159,7 @@ struct ConnectionContext {
     peer_capabilities: Rc<RefCell<HashMap<SocketAddr, u32>>>,
 }
 
-impl LanMouseConnection {
+impl Connection {
     pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
         let (recv_tx, recv_rx) = channel();
         Self {
@@ -182,7 +182,7 @@ impl LanMouseConnection {
         &self,
         event: ProtoEvent,
         handle: ClientHandle,
-    ) -> Result<(), LanMouseConnectionError> {
+    ) -> Result<(), ConnectionError> {
         let serialization_started = Timestamp::now();
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         observability::record_serialization(serialization_started);
@@ -194,7 +194,7 @@ impl LanMouseConnection {
             };
             if let Some(conn) = conn {
                 if !self.client_manager.alive(handle) {
-                    return Err(LanMouseConnectionError::TargetEmulationDisabled);
+                    return Err(ConnectionError::TargetEmulationDisabled);
                 }
                 match conn.send(buf).await {
                     Ok(_) => observability::record_sent(&event),
@@ -233,16 +233,16 @@ impl LanMouseConnection {
                 },
             ));
         }
-        Err(LanMouseConnectionError::NotConnected)
+        Err(ConnectionError::NotConnected)
     }
 
     pub(crate) async fn send_clipboard(
         &self,
         text: &str,
         handle: ClientHandle,
-    ) -> Result<(), LanMouseConnectionError> {
+    ) -> Result<(), ConnectionError> {
         let Some(addr) = self.client_manager.active_addr(handle) else {
-            return Err(LanMouseConnectionError::NotConnected);
+            return Err(ConnectionError::NotConnected);
         };
         if self
             .peer_capabilities
@@ -250,13 +250,13 @@ impl LanMouseConnection {
             .get(&addr)
             .is_none_or(|capabilities| capabilities & CAPABILITY_CLIPBOARD_TEXT == 0)
         {
-            return Err(LanMouseConnectionError::ClipboardUnsupported);
+            return Err(ConnectionError::ClipboardUnsupported);
         }
         let conn = {
             let conns = self.conns.lock().await;
             conns.get(&addr).cloned()
         }
-        .ok_or(LanMouseConnectionError::NotConnected)?;
+        .ok_or(ConnectionError::NotConnected)?;
         let packet = encode_clipboard_text(text)?;
         if let Err(error) = conn.send(&packet).await {
             log::warn!("client {handle} failed to send clipboard text: {error}");
@@ -319,7 +319,7 @@ async fn connect_to_handle(
     handle: ClientHandle,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     context: ConnectionContext,
-) -> Result<(), LanMouseConnectionError> {
+) -> Result<(), ConnectionError> {
     log::info!("client {handle} connecting ...");
     // sending did not work, figure out active conn.
     if let Some(addrs) = context.client_manager.get_ips(handle) {
@@ -367,7 +367,7 @@ async fn connect_to_handle(
         return Ok(());
     }
     connecting.lock().await.remove(&handle);
-    Err(LanMouseConnectionError::NotConnected)
+    Err(ConnectionError::NotConnected)
 }
 
 async fn ping_pong(

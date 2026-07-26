@@ -15,7 +15,7 @@ use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    connect::LanMouseConnection,
+    connect::Connection,
     observability::{self, Timestamp},
 };
 
@@ -75,7 +75,7 @@ enum CaptureRequest {
 impl Capture {
     pub(crate) fn new(
         backend: Option<input_capture::Backend>,
-        conn: LanMouseConnection,
+        conn: Connection,
         release_bind: Vec<scancode::Linux>,
     ) -> Self {
         observability::start_reporter();
@@ -179,7 +179,7 @@ struct CaptureTask {
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
-    conn: LanMouseConnection,
+    conn: Connection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,

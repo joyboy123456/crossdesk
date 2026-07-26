@@ -157,7 +157,7 @@ fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationErr
 
 fn request_accessibility_permission() -> bool {
     // Silent check. The GUI owns the one-time user-visible prompt at
-    // startup (see lan_mouse_gtk::macos_privacy).
+    // startup (see crossdesk_ui::macos_privacy).
     unsafe { AXIsProcessTrusted() }
 }
 

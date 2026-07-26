@@ -52,20 +52,6 @@ impl ClientManager {
         self.clients.borrow_mut().insert((config, state)) as ClientHandle
     }
 
-    /// set the config of the given client
-    pub fn set_config(&self, handle: ClientHandle, config: ClientConfig) {
-        if let Some((c, _)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            *c = config;
-        }
-    }
-
-    /// set the state of the given client
-    pub fn set_state(&self, handle: ClientHandle, state: ClientState) {
-        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            *s = state;
-        }
-    }
-
     /// activate the given client
     /// returns, whether the client was activated
     pub fn activate_client(&self, handle: ClientHandle) -> bool {
