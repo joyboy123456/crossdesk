@@ -268,6 +268,7 @@ pub struct Config {
     watch_rx: tokio::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigClient {
     pub ips: HashSet<IpAddr>,
     pub hostname: Option<String>,
@@ -585,5 +586,186 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The config file is written by users by hand and rewritten by the
+    /// service, so the accepted keys, their defaults and the shape of what we
+    /// write back are a compatibility contract with existing installations.
+    /// The document below mirrors the shipped `config.toml` example.
+    const SAMPLE: &str = r#"
+release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
+port = 4242
+clipboard_sync = false
+capture_backend = "windows"
+emulation_backend = "windows"
+cert_path = "/tmp/cert.pem"
+
+[authorized_fingerprints]
+"aa:bb" = "iridium"
+
+[[clients]]
+position = "right"
+hostname = "iridium"
+activate_on_startup = true
+ips = ["192.168.178.156"]
+
+[[clients]]
+position = "left"
+hostname = "thorium"
+ips = ["192.168.178.189", "192.168.178.172"]
+port = 4243
+"#;
+
+    #[test]
+    fn sample_config_parses_into_the_expected_values() {
+        let config: ConfigToml = toml::from_str(SAMPLE).expect("parse sample config");
+
+        assert_eq!(config.port, Some(4242));
+        assert_eq!(config.clipboard_sync, Some(false));
+        assert_eq!(config.capture_backend, Some(CaptureBackend::Windows));
+        assert_eq!(config.emulation_backend, Some(EmulationBackend::Windows));
+        assert_eq!(config.cert_path, Some(PathBuf::from("/tmp/cert.pem")));
+        assert_eq!(
+            config.release_bind,
+            Some(vec![
+                scancode::Linux::KeyA,
+                scancode::Linux::KeyS,
+                scancode::Linux::KeyD,
+                scancode::Linux::KeyF,
+            ])
+        );
+        assert_eq!(
+            config.authorized_fingerprints,
+            Some(HashMap::from([("aa:bb".to_owned(), "iridium".to_owned())]))
+        );
+
+        let clients = config.clients.expect("clients section");
+        assert_eq!(clients.len(), 2);
+
+        let first: ConfigClient = clients[0].clone().into();
+        assert_eq!(first.hostname.as_deref(), Some("iridium"));
+        assert_eq!(first.pos, Position::Right);
+        assert!(first.active, "activate_on_startup maps to active");
+        assert_eq!(first.port, DEFAULT_PORT, "an absent port means the default");
+        assert_eq!(
+            first.ips,
+            HashSet::from(["192.168.178.156".parse().expect("valid test address")])
+        );
+
+        let second: ConfigClient = clients[1].clone().into();
+        assert_eq!(second.pos, Position::Left);
+        assert!(!second.active, "activate_on_startup defaults to false");
+        assert_eq!(second.port, 4243);
+        assert_eq!(second.ips.len(), 2);
+    }
+
+    #[test]
+    fn omitted_keys_fall_back_to_documented_defaults() {
+        let config: ConfigToml = toml::from_str("").expect("parse empty config");
+
+        assert_eq!(config.port, None, "no port key means Config::port decides");
+        assert_eq!(config.clients, None);
+        assert_eq!(config.clipboard_sync, None);
+        assert_eq!(config.release_bind, None);
+
+        // the fallbacks Config applies for the absent keys
+        assert_eq!(DEFAULT_PORT, 4242);
+        assert!(
+            DEFAULT_RELEASE_KEYS.contains(&scancode::Linux::KeyLeftAlt),
+            "the default release bind is the four left modifiers"
+        );
+    }
+
+    /// A client that survives a write-back must come back identical, or the
+    /// service silently rewrites the user's clients on every save.
+    #[test]
+    fn clients_round_trip_through_the_config_file() {
+        let original: Vec<ConfigClient> = toml::from_str::<ConfigToml>(SAMPLE)
+            .expect("parse sample config")
+            .clients
+            .expect("clients section")
+            .into_iter()
+            .map(Into::into)
+            .collect();
+
+        let written = ConfigToml {
+            clients: Some(original.iter().cloned().map(Into::into).collect()),
+            ..Default::default()
+        };
+        let serialized = toml_edit::ser::to_string_pretty(&written).expect("serialize config");
+        let reparsed: Vec<ConfigClient> = toml::from_str::<ConfigToml>(&serialized)
+            .expect("reparse written config")
+            .clients
+            .expect("clients section")
+            .into_iter()
+            .map(Into::into)
+            .collect();
+
+        assert_eq!(reparsed, original);
+    }
+
+    #[test]
+    fn default_port_is_omitted_when_writing_clients_back() {
+        let client = ConfigClient {
+            ips: HashSet::new(),
+            hostname: Some("peer".into()),
+            port: DEFAULT_PORT,
+            pos: Position::Top,
+            active: false,
+            enter_hook: None,
+        };
+
+        let toml_client: TomlClient = client.into();
+        assert_eq!(
+            toml_client.port, None,
+            "writing the default port back would pin it across upgrades"
+        );
+        assert_eq!(
+            toml_client.activate_on_startup, None,
+            "inactive clients omit the key rather than writing false"
+        );
+    }
+
+    #[test]
+    fn local_commit_is_always_eight_bytes() {
+        assert_eq!(local_commit().len(), 8);
+    }
+
+    /// clap's own consistency checks: catches duplicate short flags, invalid
+    /// value parsers and the like at test time rather than at first run.
+    #[test]
+    fn cli_definition_is_valid() {
+        use clap::CommandFactory;
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn cli_subcommands_and_flags_are_stable() {
+        use clap::Parser;
+
+        assert!(matches!(
+            Args::parse_from(["crossdesk", "daemon"]).command,
+            Some(Command::Daemon)
+        ));
+        assert!(matches!(
+            Args::parse_from(["crossdesk", "test-capture"]).command,
+            Some(Command::TestCapture(_))
+        ));
+        assert!(matches!(
+            Args::parse_from(["crossdesk", "test-emulation"]).command,
+            Some(Command::TestEmulation(_))
+        ));
+        assert!(
+            Args::parse_from(["crossdesk"]).command.is_none(),
+            "no subcommand starts the default (GUI) mode"
+        );
+
+        let args = Args::parse_from(["crossdesk", "--port", "1234"]);
+        assert_eq!(args.port, Some(1234));
     }
 }

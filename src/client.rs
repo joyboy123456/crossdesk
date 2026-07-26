@@ -305,3 +305,187 @@ impl ClientManager {
             .map(|(_, s)| s.ips.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::from([10, 0, 0, last])
+    }
+
+    fn configured(pos: Position, active: bool) -> (ClientManager, ClientHandle) {
+        let manager = ClientManager::default();
+        let handle = manager.add_configured_client(
+            ClientConfig {
+                hostname: Some("peer".into()),
+                fix_ips: vec![ip(1)],
+                port: 4242,
+                pos,
+                cmd: None,
+            },
+            active,
+        );
+        (manager, handle)
+    }
+
+    #[test]
+    fn added_client_is_readable_and_removable() {
+        let (manager, handle) = configured(Position::Right, true);
+
+        let (config, state) = manager.get_state(handle).expect("client exists");
+        assert_eq!(config.pos, Position::Right);
+        assert_eq!(config.port, 4242);
+        assert!(state.active);
+        // add_configured_client seeds the reachable ips from the fixed ones
+        assert!(state.ips.contains(&ip(1)));
+        assert_eq!(manager.registered_clients(), vec![handle]);
+        assert_eq!(manager.active_clients(), vec![handle]);
+
+        assert!(manager.remove_client(handle).is_some());
+        assert!(manager.get_state(handle).is_none());
+        assert!(manager.registered_clients().is_empty());
+        // removing twice must not panic - the service retries on IPC replay
+        assert!(manager.remove_client(handle).is_none());
+    }
+
+    /// `Service::run` deactivates every client before activating them, because
+    /// `activate_client` reports "changed" rather than "is active". Keep that
+    /// contract: it decides whether a capture is (re)created.
+    #[test]
+    fn activation_reports_change_not_state() {
+        let (manager, handle) = configured(Position::Left, false);
+
+        assert!(manager.activate_client(handle), "first activation changes");
+        assert!(
+            !manager.activate_client(handle),
+            "activating an active client is a no-op"
+        );
+        assert!(
+            manager.deactivate_client(handle),
+            "first deactivation changes"
+        );
+        assert!(
+            !manager.deactivate_client(handle),
+            "deactivating an inactive client is a no-op"
+        );
+    }
+
+    #[test]
+    fn unknown_handles_are_reported_not_panicked_on() {
+        let manager = ClientManager::default();
+        let unknown: ClientHandle = 99;
+
+        assert!(!manager.activate_client(unknown));
+        assert!(!manager.deactivate_client(unknown));
+        assert!(!manager.set_pos(unknown, Position::Top));
+        assert!(!manager.set_hostname(unknown, Some("x".into())));
+        assert!(manager.get_state(unknown).is_none());
+        assert!(manager.get_pos(unknown).is_none());
+        assert!(manager.get_ips(unknown).is_none());
+        assert!(manager.active_addr(unknown).is_none());
+        assert!(!manager.alive(unknown));
+        manager.set_port(unknown, 1);
+        manager.set_alive(unknown, true);
+        manager.set_active_addr(unknown, None);
+    }
+
+    #[test]
+    fn lookup_by_position_and_address_only_finds_active_clients() {
+        let (manager, handle) = configured(Position::Top, true);
+        let addr = SocketAddr::new(ip(1), 4242);
+
+        assert_eq!(manager.client_at(Position::Top), Some(handle));
+        assert_eq!(manager.get_client(addr), Some(handle));
+        assert_eq!(manager.client_at(Position::Bottom), None);
+
+        manager.deactivate_client(handle);
+        assert_eq!(manager.client_at(Position::Top), None);
+        assert_eq!(manager.get_client(addr), None);
+    }
+
+    /// A position change only needs a capture update when the client is
+    /// active, which is exactly what `set_pos` returns.
+    #[test]
+    fn set_pos_requests_capture_update_only_when_active() {
+        let (manager, handle) = configured(Position::Left, true);
+
+        assert!(manager.set_pos(handle, Position::Right));
+        assert!(!manager.set_pos(handle, Position::Right), "same position");
+        assert_eq!(manager.get_pos(handle), Some(Position::Right));
+
+        manager.deactivate_client(handle);
+        assert!(
+            !manager.set_pos(handle, Position::Top),
+            "inactive client needs no capture update"
+        );
+        assert_eq!(manager.get_pos(handle), Some(Position::Top));
+    }
+
+    #[test]
+    fn hostname_change_invalidates_resolved_addresses() {
+        let (manager, handle) = configured(Position::Left, true);
+        manager.set_dns_ips(handle, vec![ip(2)]);
+        manager.set_active_addr(handle, Some(SocketAddr::new(ip(2), 4242)));
+
+        assert!(manager.set_hostname(handle, Some("other".into())));
+
+        let (_, state) = manager.get_state(handle).expect("client exists");
+        assert!(state.active_addr.is_none(), "stale address must be dropped");
+        assert!(
+            state.dns_ips.is_empty(),
+            "stale dns results must be dropped"
+        );
+        assert_eq!(state.ips, HashSet::from([ip(1)]), "fixed ips remain");
+
+        assert!(
+            !manager.set_hostname(handle, Some("other".into())),
+            "setting the same hostname is a no-op"
+        );
+    }
+
+    #[test]
+    fn reachable_ips_are_the_union_of_fixed_and_resolved() {
+        let (manager, handle) = configured(Position::Left, true);
+        manager.set_dns_ips(handle, vec![ip(2), ip(3)]);
+
+        assert_eq!(
+            manager.get_ips(handle).expect("client exists"),
+            HashSet::from([ip(1), ip(2), ip(3)])
+        );
+
+        manager.set_fix_ips(handle, vec![ip(4)]);
+        assert_eq!(
+            manager.get_ips(handle).expect("client exists"),
+            HashSet::from([ip(2), ip(3), ip(4)]),
+            "replacing fixed ips keeps resolved ones"
+        );
+    }
+
+    #[test]
+    fn port_change_rewrites_the_active_address() {
+        let (manager, handle) = configured(Position::Left, true);
+        manager.set_active_addr(handle, Some(SocketAddr::new(ip(1), 4242)));
+
+        manager.set_port(handle, 5000);
+
+        assert_eq!(manager.get_port(handle), Some(5000));
+        assert_eq!(
+            manager.active_addr(handle),
+            Some(SocketAddr::new(ip(1), 5000)),
+            "the open connection must follow the new port"
+        );
+    }
+
+    #[test]
+    fn handles_are_not_reused_while_a_client_is_alive() {
+        let manager = ClientManager::default();
+        let first = manager.add_client();
+        let second = manager.add_client();
+
+        assert_ne!(first, second);
+        manager.remove_client(first);
+        assert!(manager.get_state(first).is_none());
+        assert!(manager.get_state(second).is_some());
+    }
+}

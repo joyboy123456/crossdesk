@@ -415,9 +415,281 @@ encode_impl!(f64);
 #[cfg(test)]
 mod tests {
     use super::{
-        CAPABILITY_CLIPBOARD_TEXT, MAX_CLIPBOARD_TEXT_SIZE, MAX_EVENT_SIZE, ProtoEvent,
-        ProtocolError, WireEvent, decode_wire_event, encode_clipboard_text,
+        CAPABILITY_CLIPBOARD_TEXT, EventType, MAX_CLIPBOARD_TEXT_SIZE, MAX_EVENT_SIZE,
+        MAX_WIRE_SIZE, Position, ProtoEvent, ProtocolError, WireEvent, decode_wire_event,
+        encode_clipboard_text,
     };
+    use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
+
+    fn encode(event: ProtoEvent) -> Vec<u8> {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        buf[..len].to_vec()
+    }
+
+    /// Every peer on the network decodes these bytes, so the encoding is a
+    /// compatibility contract: changing it silently breaks interoperability
+    /// with peers running an older build. Update these expectations only
+    /// together with a deliberate, negotiated protocol change.
+    #[test]
+    fn wire_format_is_frozen() {
+        // event id, then big-endian fields in declaration order
+        assert_eq!(
+            encode(ProtoEvent::Input(InputEvent::Pointer(
+                PointerEvent::Motion {
+                    time: 1,
+                    dx: 2.0,
+                    dy: -3.0,
+                }
+            ))),
+            [
+                EventType::PointerMotion as u8,
+                0,
+                0,
+                0,
+                1, // time
+                0x40,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0, // dx = 2.0
+                0xc0,
+                0x08,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0, // dy = -3.0
+            ]
+        );
+        assert_eq!(
+            encode(ProtoEvent::Input(InputEvent::Pointer(
+                PointerEvent::Button {
+                    time: 1,
+                    button: 0x110,
+                    state: 1,
+                }
+            ))),
+            [
+                EventType::PointerButton as u8,
+                0,
+                0,
+                0,
+                1, // time
+                0,
+                0,
+                1,
+                0x10, // button
+                0,
+                0,
+                0,
+                1, // state
+            ]
+        );
+        assert_eq!(
+            encode(ProtoEvent::Input(InputEvent::Pointer(
+                PointerEvent::AxisDiscrete120 {
+                    axis: 1,
+                    value: -120
+                }
+            ))),
+            [
+                EventType::PointerAxisValue120 as u8,
+                1, // axis
+                0xff,
+                0xff,
+                0xff,
+                0x88, // value = -120
+            ]
+        );
+        assert_eq!(
+            encode(ProtoEvent::Input(InputEvent::Keyboard(
+                KeyboardEvent::Key {
+                    time: 1,
+                    key: 30,
+                    state: 1,
+                }
+            ))),
+            [
+                EventType::KeyboardKey as u8,
+                0,
+                0,
+                0,
+                1, // time
+                0,
+                0,
+                0,
+                30, // key
+                1,  // state
+            ]
+        );
+        assert_eq!(encode(ProtoEvent::Ping), [EventType::Ping as u8]);
+        assert_eq!(encode(ProtoEvent::Pong(true)), [EventType::Pong as u8, 1]);
+        assert_eq!(
+            encode(ProtoEvent::Enter(Position::Bottom)),
+            [EventType::Enter as u8, Position::Bottom as u8]
+        );
+        assert_eq!(
+            encode(ProtoEvent::Leave(7)),
+            [EventType::Leave as u8, 0, 0, 0, 7]
+        );
+        assert_eq!(
+            encode(ProtoEvent::Ack(7)),
+            [EventType::Ack as u8, 0, 0, 0, 7]
+        );
+        assert_eq!(
+            encode(ProtoEvent::Hello {
+                commit: *b"deadbeef",
+                capabilities: CAPABILITY_CLIPBOARD_TEXT,
+            }),
+            [
+                EventType::Hello as u8,
+                b'd',
+                b'e',
+                b'a',
+                b'd',
+                b'b',
+                b'e',
+                b'e',
+                b'f', // commit
+                0,
+                0,
+                0,
+                1, // capabilities
+            ]
+        );
+
+        // clipboard packets use a reserved id outside the EventType range,
+        // followed by a big-endian payload length
+        assert_eq!(
+            encode_clipboard_text("hi").expect("encode clipboard"),
+            [0x80, 0, 0, 0, 2, b'h', b'i']
+        );
+    }
+
+    /// Sizing constants are part of the same contract: peers allocate receive
+    /// buffers from them and reject anything larger.
+    #[test]
+    fn protocol_limits_are_frozen() {
+        assert_eq!(MAX_EVENT_SIZE, 21);
+        assert_eq!(MAX_CLIPBOARD_TEXT_SIZE, 16 * 1024);
+        assert_eq!(MAX_WIRE_SIZE, 5 + 16 * 1024);
+        assert_eq!(CAPABILITY_CLIPBOARD_TEXT, 1);
+    }
+
+    #[test]
+    fn every_event_round_trips() {
+        let events = [
+            ProtoEvent::Enter(Position::Left),
+            ProtoEvent::Enter(Position::Right),
+            ProtoEvent::Enter(Position::Top),
+            ProtoEvent::Enter(Position::Bottom),
+            ProtoEvent::Leave(u32::MAX),
+            ProtoEvent::Ack(0),
+            ProtoEvent::Ping,
+            ProtoEvent::Pong(false),
+            ProtoEvent::Pong(true),
+            ProtoEvent::Hello {
+                commit: *b"01234567",
+                capabilities: u32::MAX,
+            },
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
+                time: 42,
+                dx: -1.5,
+                dy: 0.25,
+            })),
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Button {
+                time: 42,
+                button: 0x111,
+                state: 0,
+            })),
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Axis {
+                time: 42,
+                axis: 1,
+                value: 12.5,
+            })),
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::AxisDiscrete120 {
+                axis: 0,
+                value: 120,
+            })),
+            ProtoEvent::Input(InputEvent::Keyboard(KeyboardEvent::Key {
+                time: 42,
+                key: 103,
+                state: 1,
+            })),
+            ProtoEvent::Input(InputEvent::Keyboard(KeyboardEvent::Modifiers {
+                depressed: 1,
+                latched: 2,
+                locked: 4,
+                group: 8,
+            })),
+        ];
+
+        for event in events {
+            let encoded = encode(event);
+            let WireEvent::Protocol(decoded) =
+                decode_wire_event(&encoded).expect("decode round-tripped event")
+            else {
+                panic!("expected a protocol event for {event:?}");
+            };
+            // ProtoEvent has no PartialEq; compare the canonical encoding
+            assert_eq!(encode(decoded), encoded, "round trip changed {event:?}");
+        }
+    }
+
+    #[test]
+    fn oversized_clipboard_packet_is_rejected_without_allocating() {
+        // a peer claiming a huge payload must be rejected on the header alone
+        let mut packet = vec![0x80];
+        packet.extend_from_slice(&(u32::MAX).to_be_bytes());
+
+        assert!(matches!(
+            decode_wire_event(&packet),
+            Err(ProtocolError::ClipboardTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn truncated_clipboard_packet_is_rejected() {
+        let mut packet = encode_clipboard_text("hello").expect("encode clipboard");
+        packet.pop();
+
+        assert!(matches!(
+            decode_wire_event(&packet),
+            Err(ProtocolError::InvalidPacketLength { .. })
+        ));
+    }
+
+    #[test]
+    fn non_utf8_clipboard_payload_is_rejected() {
+        let packet = [0x80, 0, 0, 0, 1, 0xff];
+
+        assert!(matches!(
+            decode_wire_event(&packet),
+            Err(ProtocolError::InvalidClipboardText(_))
+        ));
+    }
+
+    #[test]
+    fn empty_packet_is_rejected() {
+        assert!(matches!(
+            decode_wire_event(&[]),
+            Err(ProtocolError::InvalidPacketLength { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_event_id_is_rejected() {
+        // forward compatibility: callers skip the datagram rather than
+        // dropping the connection, so decoding must fail cleanly
+        assert!(matches!(
+            decode_wire_event(&[0x7f]),
+            Err(ProtocolError::InvalidEventId(_))
+        ));
+    }
 
     #[test]
     fn hello_capabilities_round_trip() {

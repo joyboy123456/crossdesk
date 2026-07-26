@@ -168,3 +168,96 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    /// Users script against these subcommands, so their names and argument
+    /// order are a compatibility contract.
+    #[test]
+    fn cli_definition_is_valid() {
+        CliArgs::command().debug_assert();
+    }
+
+    fn parse(args: &[&str]) -> CliSubcommand {
+        CliArgs::parse_from(std::iter::once("cli").chain(args.iter().copied())).command
+    }
+
+    #[test]
+    fn subcommands_parse_as_documented() {
+        assert_eq!(parse(&["list"]), CliSubcommand::List);
+        assert_eq!(parse(&["activate", "3"]), CliSubcommand::Activate { id: 3 });
+        assert_eq!(
+            parse(&["deactivate", "3"]),
+            CliSubcommand::Deactivate { id: 3 }
+        );
+        assert_eq!(
+            parse(&["remove-client", "3"]),
+            CliSubcommand::RemoveClient { id: 3 }
+        );
+        assert_eq!(
+            parse(&["set-port", "3", "4242"]),
+            CliSubcommand::SetPort { id: 3, port: 4242 }
+        );
+        assert_eq!(
+            parse(&["set-position", "3", "right"]),
+            CliSubcommand::SetPosition {
+                id: 3,
+                pos: Position::Right
+            }
+        );
+        assert_eq!(
+            parse(&["set-host", "3", "peer"]),
+            CliSubcommand::SetHost {
+                id: 3,
+                host: Some("peer".into())
+            }
+        );
+        assert_eq!(parse(&["enable-capture"]), CliSubcommand::EnableCapture);
+        assert_eq!(parse(&["enable-emulation"]), CliSubcommand::EnableEmulation);
+        assert_eq!(parse(&["save-config"]), CliSubcommand::SaveConfig);
+        assert_eq!(
+            parse(&["authorize-key", "desc", "aa:bb"]),
+            CliSubcommand::AuthorizeKey {
+                description: "desc".into(),
+                sha256_fingerprint: "aa:bb".into()
+            }
+        );
+    }
+
+    #[test]
+    fn add_client_flags_are_stable() {
+        assert_eq!(
+            parse(&[
+                "add-client",
+                "--hostname",
+                "peer",
+                "--port",
+                "4243",
+                "--ips",
+                "10.0.0.1",
+                "--enter-hook",
+                "echo hi",
+            ]),
+            CliSubcommand::AddClient(Client {
+                hostname: Some("peer".into()),
+                port: Some(4243),
+                ips: Some(vec!["10.0.0.1".parse().expect("valid test address")]),
+                enter_hook: Some("echo hi".into()),
+            })
+        );
+
+        // every flag is optional: a bare add-client must stay valid
+        assert_eq!(
+            parse(&["add-client"]),
+            CliSubcommand::AddClient(Client {
+                hostname: None,
+                port: None,
+                ips: None,
+                enter_hook: None,
+            })
+        );
+    }
+}

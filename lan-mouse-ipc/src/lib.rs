@@ -280,7 +280,148 @@ pub enum Status {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientConfig, FrontendRequest, Position};
+    use super::{
+        ClientConfig, ClientState, DEFAULT_PORT, FrontendEvent, FrontendRequest, Position, Status,
+    };
+
+    /// Frontends and the service are built and shipped separately (the CLI
+    /// may be an older build than the daemon it talks to), so the JSON
+    /// representation of the IPC types is a compatibility contract. These
+    /// expectations pin the variant names and field names; change them only
+    /// alongside a deliberate IPC version bump.
+    #[test]
+    fn request_json_representation_is_frozen() {
+        for (request, expected) in [
+            (
+                FrontendRequest::Activate(3, true),
+                r#"{"Activate":[3,true]}"#,
+            ),
+            (FrontendRequest::Create, r#""Create""#),
+            (FrontendRequest::ChangePort(4242), r#"{"ChangePort":4242}"#),
+            (FrontendRequest::Delete(1), r#"{"Delete":1}"#),
+            (FrontendRequest::Enumerate(), r#"{"Enumerate":[]}"#),
+            (FrontendRequest::ResolveDns(1), r#"{"ResolveDns":1}"#),
+            (
+                FrontendRequest::UpdateHostname(1, Some("host".into())),
+                r#"{"UpdateHostname":[1,"host"]}"#,
+            ),
+            (
+                FrontendRequest::UpdatePosition(1, Position::Top),
+                r#"{"UpdatePosition":[1,"top"]}"#,
+            ),
+            (FrontendRequest::EnableCapture, r#""EnableCapture""#),
+            (FrontendRequest::EnableEmulation, r#""EnableEmulation""#),
+            (
+                FrontendRequest::SetClipboardSync(true),
+                r#"{"SetClipboardSync":true}"#,
+            ),
+            (FrontendRequest::Sync, r#""Sync""#),
+            (
+                FrontendRequest::AuthorizeKey("desc".into(), "aa:bb".into()),
+                r#"{"AuthorizeKey":["desc","aa:bb"]}"#,
+            ),
+            (FrontendRequest::SaveConfiguration, r#""SaveConfiguration""#),
+            (FrontendRequest::ShutdownService, r#""ShutdownService""#),
+        ] {
+            let json = serde_json::to_string(&request).expect("serialize request");
+            assert_eq!(json, expected, "encoding of {request:?} changed");
+            let decoded: FrontendRequest =
+                serde_json::from_str(&json).expect("deserialize request");
+            assert_eq!(decoded, request);
+        }
+    }
+
+    #[test]
+    fn event_json_representation_is_frozen() {
+        for (event, expected) in [
+            (FrontendEvent::Deleted(2), r#"{"Deleted":2}"#),
+            (FrontendEvent::NoSuchClient(2), r#"{"NoSuchClient":2}"#),
+            (
+                FrontendEvent::PortChanged(4242, None),
+                r#"{"PortChanged":[4242,null]}"#,
+            ),
+            (FrontendEvent::Error("boom".into()), r#"{"Error":"boom"}"#),
+            (
+                FrontendEvent::CaptureStatus(Status::Enabled),
+                r#"{"CaptureStatus":"Enabled"}"#,
+            ),
+            (
+                FrontendEvent::EmulationStatus(Status::Disabled),
+                r#"{"EmulationStatus":"Disabled"}"#,
+            ),
+            (
+                FrontendEvent::PublicKeyFingerprint("aa:bb".into()),
+                r#"{"PublicKeyFingerprint":"aa:bb"}"#,
+            ),
+            (
+                FrontendEvent::ClipboardState {
+                    enabled: true,
+                    available: false,
+                },
+                r#"{"ClipboardState":{"enabled":true,"available":false}}"#,
+            ),
+            (
+                FrontendEvent::ConnectionAttempt {
+                    fingerprint: "aa:bb".into(),
+                },
+                r#"{"ConnectionAttempt":{"fingerprint":"aa:bb"}}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&event).expect("serialize event");
+            assert_eq!(json, expected, "encoding of {event:?} changed");
+            serde_json::from_str::<FrontendEvent>(&json).expect("deserialize event");
+        }
+    }
+
+    #[test]
+    fn client_config_and_state_json_is_frozen() {
+        let config = ClientConfig {
+            hostname: Some("host".into()),
+            fix_ips: vec!["10.0.0.1".parse().expect("valid test address")],
+            port: 4242,
+            pos: Position::Left,
+            cmd: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&config).expect("serialize config"),
+            r#"{"hostname":"host","fix_ips":["10.0.0.1"],"port":4242,"pos":"left","cmd":null}"#
+        );
+
+        // a default state must round-trip through an older peer's decoder,
+        // so every field carries a serde-representable default
+        let state = ClientState::default();
+        let json = serde_json::to_string(&state).expect("serialize state");
+        assert_eq!(
+            json,
+            r#"{"active":false,"active_addr":null,"alive":false,"dns_ips":[],"ips":[],"has_pressed_keys":false,"resolving":false,"peer_commit":null}"#
+        );
+        serde_json::from_str::<ClientState>(&json).expect("deserialize state");
+    }
+
+    #[test]
+    fn defaults_are_frozen() {
+        assert_eq!(DEFAULT_PORT, 4242);
+        assert_eq!(ClientConfig::default().port, DEFAULT_PORT);
+        assert_eq!(ClientConfig::default().pos, Position::Left);
+        assert_eq!(Status::default(), Status::Disabled);
+    }
+
+    #[test]
+    fn position_parses_from_its_own_display_form() {
+        for pos in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            let rendered = pos.to_string();
+            assert_eq!(
+                Position::try_from(rendered.as_str()),
+                Ok(pos),
+                "{rendered} did not parse back"
+            );
+        }
+    }
 
     #[test]
     fn configured_client_request_round_trips_as_json() {
