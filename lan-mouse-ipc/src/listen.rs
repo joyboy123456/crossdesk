@@ -71,9 +71,20 @@ impl AsyncFrontendListener {
         };
 
         #[cfg(windows)]
-        let listener = match TcpListener::bind(crate::IPC_ADDR).await {
-            Ok(ls) => ls,
-            // some other lan-mouse instance has bound the socket in the meantime
+        let listener = match TcpListener::bind((crate::IPC_HOST, 0u16)).await {
+            Ok(ls) => {
+                // bind to port 0 lets the OS pick a free port that can never
+                // fall in a Windows dynamic TCP exclusion range; publish it so
+                // the frontend can connect.
+                let port = ls
+                    .local_addr()
+                    .map_err(IpcListenerCreationError::Bind)?
+                    .port();
+                crate::write_ipc_port(port).map_err(IpcListenerCreationError::Bind)?;
+                ls
+            }
+            // bind to port 0 cannot fail with AddrInUse, but keep the guard so
+            // an error is still mapped to a clear variant.
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
                 return Err(IpcListenerCreationError::AlreadyRunning);
             }
@@ -118,6 +129,15 @@ impl Drop for AsyncFrontendListener {
     fn drop(&mut self) {
         log::debug!("remove socket: {:?}", self.socket_path);
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AsyncFrontendListener {
+    fn drop(&mut self) {
+        // remove the published IPC port so a stale file never makes the
+        // frontend wait on a socket nobody is listening on
+        crate::remove_ipc_port();
     }
 }
 

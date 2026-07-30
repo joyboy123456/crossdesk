@@ -25,10 +25,38 @@ pub use connect_async::{AsyncFrontendEventReader, AsyncFrontendRequestWriter, co
 pub use listen::AsyncFrontendListener;
 
 #[cfg(windows)]
-// 4243 falls inside a Hyper-V/WSL TCP exclusion range (4214-4313) on some
-// Windows hosts, so binding it fails with WSAEACCES (10013) and the daemon
-// never starts. 4400 sits in a gap between the current exclusion ranges.
-const IPC_ADDR: &str = "127.0.0.1:4400";
+// Local IPC between frontend and daemon uses a TCP socket on loopback. The
+// port is chosen by the OS (bind to port 0) and published to a temp file, so
+// it can never land in a Windows dynamic TCP exclusion range: Hyper-V/WSL
+// reserves 4214-4313, which used to swallow the fixed port 4243 and fail the
+// daemon with WSAEACCES (10013).
+pub(crate) const IPC_HOST: &str = "127.0.0.1";
+
+#[cfg(windows)]
+fn ipc_port_file() -> std::path::PathBuf {
+    std::env::temp_dir().join("crossdesk-ipc-port")
+}
+
+/// The daemon calls this with the OS-assigned port so the frontend can find it.
+#[cfg(windows)]
+pub(crate) fn write_ipc_port(port: u16) -> io::Result<()> {
+    std::fs::write(ipc_port_file(), port.to_string())
+}
+
+/// `None` when no daemon has published a port yet.
+#[cfg(windows)]
+pub(crate) fn read_ipc_port() -> Option<u16> {
+    std::fs::read_to_string(ipc_port_file())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Called when the daemon stops, so a stale port file never misleads the
+/// frontend into waiting on a dead socket.
+#[cfg(windows)]
+pub(crate) fn remove_ipc_port() {
+    let _ = std::fs::remove_file(ipc_port_file());
+}
 
 #[derive(Debug, Error)]
 pub enum ConnectionError {
@@ -414,11 +442,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_ipc_is_loopback_and_separate_from_device_transport() {
-        let addr: std::net::SocketAddr = super::IPC_ADDR.parse().expect("valid IPC address");
+    fn windows_ipc_uses_loopback_and_a_temp_port_file() {
+        let host: std::net::IpAddr = super::IPC_HOST.parse().expect("valid IPC host");
+        assert!(host.is_loopback());
 
-        assert!(addr.ip().is_loopback());
-        assert_ne!(addr.port(), DEFAULT_PORT);
+        // the port file lives in the per-user temp dir, so two daemons on
+        // different accounts never race for it
+        let path = super::ipc_port_file();
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert_eq!(path.file_name().unwrap(), "crossdesk-ipc-port");
     }
 
     #[test]

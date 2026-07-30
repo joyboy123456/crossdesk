@@ -75,8 +75,10 @@ fn wait_for_service() -> Result<UnixStream, ConnectionError> {
 fn wait_for_service() -> Result<TcpStream, ConnectionError> {
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = TcpStream::connect(crate::IPC_ADDR) {
-            break Ok(stream);
+        if let Some(port) = crate::read_ipc_port() {
+            if let Ok(stream) = TcpStream::connect((crate::IPC_HOST, port)) {
+                break Ok(stream);
+            }
         }
         thread::sleep(exponential_back_off(&mut duration));
     }

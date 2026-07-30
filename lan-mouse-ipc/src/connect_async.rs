@@ -97,8 +97,10 @@ async fn wait_for_service() -> Result<UnixStream, ConnectionError> {
 async fn wait_for_service() -> Result<TcpStream, ConnectionError> {
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = TcpStream::connect(crate::IPC_ADDR).await {
-            break Ok(stream);
+        if let Some(port) = crate::read_ipc_port() {
+            if let Ok(stream) = TcpStream::connect((crate::IPC_HOST, port)).await {
+                break Ok(stream);
+            }
         }
         tokio::time::sleep(exponential_back_off(&mut duration)).await;
     }
