@@ -17,9 +17,10 @@ futures = { workspace = true }
 hostname = "0.4.0"
 iconflow = { version = "1.0.0", features = ["pack-lucide"] }
 lan-mouse-ipc = { workspace = true }
+lan-mouse-proto = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 tray-icon = { version = "0.24.1", default-features = false }
 
 [dev-dependencies]

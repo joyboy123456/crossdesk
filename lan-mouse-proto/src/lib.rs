@@ -7,6 +7,8 @@ use std::{
 };
 use thiserror::Error;
 
+pub mod discovery;
+
 /// defines the maximum size an encoded event can take up
 /// this is currently the pointer motion event
 /// type: u8, time: u32, dx: f64, dy: f64

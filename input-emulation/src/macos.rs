@@ -93,7 +93,7 @@ pub(crate) struct MacOSEmulation {
     /// global event source for all events
     event_source: CGEventSource,
     /// task handle for key repeats
-    repeat_task: Option<JoinHandle<()>>,
+    repeat_task: Option<RepeatTask>,
     /// current state of the mouse buttons (tracked by evdev button code)
     pressed_buttons: HashSet<u32>,
     /// button previously pressed (evdev button code)
@@ -108,6 +108,11 @@ pub(crate) struct MacOSEmulation {
     notify_repeat_task: Arc<Notify>,
     /// cached natural-scrolling preference of this host
     natural_scroll: NaturalScrollCache,
+}
+
+struct RepeatTask {
+    key: CGKeyCode,
+    task: JoinHandle<()>,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -170,29 +175,29 @@ impl MacOSEmulation {
                     }
                 }
             }
-            // Always release the key with the correct CGKeyCode, regardless of
-            // whether the repeat loop ran. This matches @feschber's review
-            // request: "still release the key repeat task but with the correct
-            // code."
-            //
-            // Do NOT call update_modifiers here: `key` is a Mac CGKeyCode but
-            // update_modifiers expects a Linux evdev scancode, and the two
-            // codespaces collide (e.g. Mac LeftShift=56 == Linux KeyLeftAlt=56,
-            // Mac Down=125 == Linux KeyLeftMeta=125), corrupting modifier
-            // state for chords like Shift+Option+X or Cmd+Down. Modifier state
-            // is owned by the main consume() loop, which already calls
-            // update_modifiers with the correct Linux scancode on the real key
-            // release event from the client.
-            key_event(event_source.clone(), key, 0, modifiers.get());
         });
-        self.repeat_task = Some(repeat_task);
+        self.repeat_task = Some(RepeatTask {
+            key,
+            task: repeat_task,
+        });
     }
 
     async fn cancel_repeat_task(&mut self) {
-        if let Some(task) = self.repeat_task.take() {
+        if let Some(repeat) = self.repeat_task.take() {
             self.notify_repeat_task.notify_waiters();
-            let _ = task.await;
+            let _ = repeat.task.await;
         }
+    }
+
+    async fn release_key(&mut self, key: CGKeyCode) {
+        if self
+            .repeat_task
+            .as_ref()
+            .is_some_and(|repeat| repeat.key == key)
+        {
+            self.cancel_repeat_task().await;
+        }
+        key_event(self.event_source.clone(), key, 0, self.modifier_state.get());
     }
 }
 
@@ -414,6 +419,13 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
+                        // Set modifier flags from our tracked state rather than
+                        // inheriting the system's CombinedSessionState. If a
+                        // modifier key-up was lost over UDP the system can
+                        // think a modifier (e.g. Control) is still held, which
+                        // would silently turn mouse events into modified
+                        // variants (Control+click = right-click on macOS).
+                        event.set_flags(to_cgevent_flags(self.modifier_state.get()));
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::Button {
@@ -494,6 +506,10 @@ impl Emulation for MacOSEmulation {
                                 btn_num,
                             );
                         }
+                        // Set modifier flags from our tracked state rather than
+                        // inheriting the system's CombinedSessionState. See the
+                        // matching comment in the Motion branch above.
+                        event.set_flags(to_cgevent_flags(self.modifier_state.get()));
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::Axis {
@@ -580,7 +596,7 @@ impl Emulation for MacOSEmulation {
                     match state {
                         // pressed
                         1 => self.spawn_repeat_task(code).await,
-                        _ => self.cancel_repeat_task().await,
+                        _ => self.release_key(code).await,
                     }
                 }
                 KeyboardEvent::Modifiers {
@@ -602,7 +618,9 @@ impl Emulation for MacOSEmulation {
 
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.cancel_repeat_task().await;
+    }
 
     async fn enter(&mut self, _handle: EmulationHandle, pos: Position, ratio: f64) {
         let Some(bounds) = desktop_bounds() else {

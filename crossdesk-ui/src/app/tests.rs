@@ -126,6 +126,13 @@ fn device_editor_selects_direction_and_sends_complete_create() {
     harness
         .get_by_role_and_label(Role::Button, "添加设备")
         .click();
+    // an egui Area is positioned with its previous frame's size, so a freshly
+    // opened dialog needs one settle frame before position-based clicks
+    harness.run_steps(2);
+    // the scan dialog opens first; manual entry leads to the editor
+    harness
+        .get_by_role_and_label(Role::Button, "手动添加")
+        .click();
     harness.step();
 
     harness
@@ -163,6 +170,74 @@ fn device_editor_selects_direction_and_sends_complete_create() {
     assert_eq!(config.port, lan_mouse_ipc::DEFAULT_PORT);
     assert_eq!(config.pos, Position::Left);
     assert!(active);
+}
+
+#[test]
+fn scan_dialog_lists_found_devices_and_prefills_editor() {
+    let mut harness = app_harness();
+    harness
+        .get_by_role_and_label(Role::Button, "添加设备")
+        .click();
+    // let the freshly opened dialog reach its final position (an egui Area is
+    // positioned with its previous frame's size)
+    harness.run_steps(2);
+    harness.get_by_label("正在扫描局域网设备…");
+
+    let scan = harness.state().scan.as_ref().expect("scan dialog is open");
+    scan.inject(crate::scan::ScanEvent::Found(crate::scan::FoundDevice {
+        hostname: "mac-mini".into(),
+        addr: "192.168.1.42".parse().expect("valid address"),
+        port: lan_mouse_ipc::DEFAULT_PORT,
+    }));
+    scan.inject(crate::scan::ScanEvent::Finished);
+    harness.step();
+
+    harness.get_by_label("mac-mini");
+    harness.get_by_role_and_label(Role::Button, "添加").click();
+    harness.step();
+
+    assert!(harness.state().scan.is_none());
+    let editor = harness.state().editor.as_ref().expect("editor is open");
+    assert_eq!(editor.draft.hostname, "mac-mini");
+    assert_eq!(editor.draft.ips, "192.168.1.42");
+    assert_eq!(editor.draft.port, lan_mouse_ipc::DEFAULT_PORT.to_string());
+}
+
+#[test]
+fn scan_dialog_marks_known_and_local_devices_without_add_button() {
+    let mut harness = app_harness();
+    add_active_screen(harness.state_mut(), 5, Position::Right, "mac-mini", true);
+    harness.state_mut().local_hostname = "this-pc".into();
+    harness.state_mut().local_port = lan_mouse_ipc::DEFAULT_PORT.to_string();
+    harness
+        .get_by_role_and_label(Role::Button, "添加设备")
+        .click();
+    harness.step();
+
+    let scan = harness.state().scan.as_ref().expect("scan dialog is open");
+    let known = crate::scan::FoundDevice {
+        hostname: "mac-mini".into(),
+        addr: "192.168.1.42".parse().expect("valid address"),
+        port: lan_mouse_ipc::DEFAULT_PORT,
+    };
+    let local = crate::scan::FoundDevice {
+        hostname: "this-pc".into(),
+        addr: "192.168.1.2".parse().expect("valid address"),
+        port: lan_mouse_ipc::DEFAULT_PORT,
+    };
+    scan.inject(crate::scan::ScanEvent::Found(known));
+    scan.inject(crate::scan::ScanEvent::Found(local));
+    scan.inject(crate::scan::ScanEvent::Finished);
+    harness.step();
+
+    harness.get_by_label("已添加");
+    harness.get_by_label("本机");
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "添加")
+            .is_none(),
+        "known and local devices must not offer an add button"
+    );
 }
 
 #[test]

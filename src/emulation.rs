@@ -22,7 +22,7 @@ use tokio::{select, task::spawn_local};
 use tokio_util::sync::CancellationToken;
 
 /// how often connected peers are checked for liveness
-const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// a peer that has not sent anything for this long is considered gone; its
 /// emulation handle is destroyed so held keys do not stick
@@ -222,7 +222,13 @@ impl ListenTask {
                                         self.emulation_proxy.remove(addr);
                                         self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     }
-                                    ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr, received_at),
+                                    ProtoEvent::Input(event) => {
+                                        if input_allowed(&self.entered, addr) {
+                                            self.emulation_proxy.consume(event, addr, received_at);
+                                        } else {
+                                            log::debug!("ignoring input from {addr} outside an entered session");
+                                        }
+                                    }
                                     ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
                                     ProtoEvent::Hello { commit, capabilities } => {
                                         self.listener.set_peer_capabilities(addr, capabilities);
@@ -337,6 +343,10 @@ impl ListenTask {
         self.listener.reply(addr, ProtoEvent::Leave(0)).await;
         true
     }
+}
+
+fn input_allowed(entered: &HashSet<SocketAddr>, addr: SocketAddr) -> bool {
+    entered.contains(&addr)
 }
 
 /// proxy handling the actual input emulation,
@@ -592,6 +602,18 @@ impl EmulationTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_is_accepted_only_while_peer_is_entered() {
+        let addr = "127.0.0.1:4242".parse().expect("valid socket address");
+        let mut entered = HashSet::new();
+
+        assert!(!input_allowed(&entered, addr));
+        entered.insert(addr);
+        assert!(input_allowed(&entered, addr));
+        entered.remove(&addr);
+        assert!(!input_allowed(&entered, addr));
+    }
 
     /// A dummy backend accepts every event and throws it away. If the service
     /// announced that as enabled, a peer would be allowed to enter this

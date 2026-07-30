@@ -3,6 +3,7 @@ mod bridge;
 #[cfg(target_os = "macos")]
 mod macos_privacy;
 mod model;
+mod scan;
 mod theme;
 mod tray;
 

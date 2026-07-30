@@ -24,6 +24,12 @@ pub use connect::{FrontendEventReader, FrontendRequestWriter, connect};
 pub use connect_async::{AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async};
 pub use listen::AsyncFrontendListener;
 
+#[cfg(windows)]
+// 4243 falls inside a Hyper-V/WSL TCP exclusion range (4214-4313) on some
+// Windows hosts, so binding it fails with WSAEACCES (10013) and the daemon
+// never starts. 4400 sits in a gap between the current exclusion ranges.
+const IPC_ADDR: &str = "127.0.0.1:4400";
+
 #[derive(Debug, Error)]
 pub enum ConnectionError {
     #[error(transparent)]
@@ -404,6 +410,15 @@ mod tests {
         assert_eq!(ClientConfig::default().port, DEFAULT_PORT);
         assert_eq!(ClientConfig::default().pos, Position::Left);
         assert_eq!(Status::default(), Status::Disabled);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ipc_is_loopback_and_separate_from_device_transport() {
+        let addr: std::net::SocketAddr = super::IPC_ADDR.parse().expect("valid IPC address");
+
+        assert!(addr.ip().is_loopback());
+        assert_ne!(addr.port(), DEFAULT_PORT);
     }
 
     #[test]

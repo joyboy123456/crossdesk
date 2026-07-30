@@ -32,6 +32,13 @@ const RELEASE_LOG_DEBOUNCE: Duration = Duration::from_millis(500);
 /// bind, which users may not know.
 const ENTER_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// how often to re-send the current modifier state to the active peer while
+/// sending input. Key events travel over UDP/DTLS and can be dropped; without
+/// periodic re-sync a lost modifier key-up (especially Control on macOS,
+/// where Control+Click = right-click) leaves the peer with a stuck modifier
+/// until the next FlagsChanged happens to arrive or the peer times out.
+const MODIFIER_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+
 pub(crate) struct Capture {
     task: TaskHandle,
     request_tx: Sender<CaptureRequest>,
@@ -358,6 +365,9 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        let mut heartbeat = tokio::time::interval(MODIFIER_HEARTBEAT_INTERVAL);
+        // skip the immediate first tick — no events have been captured yet
+        heartbeat.tick().await;
         loop {
             tokio::select! {
                 event = capture.next() => match event {
@@ -425,6 +435,27 @@ impl CaptureTask {
                         if broadcast {
                             if let Some(text) = self.clipboard_text.as_deref() {
                                 self.conn.broadcast_clipboard(text).await;
+                            }
+                        }
+                    }
+                },
+                _ = heartbeat.tick() => {
+                    // Re-send the current modifier state so a dropped key-up
+                    // over UDP doesn't leave the peer with a stuck modifier.
+                    // Only needed while actively sending input.
+                    if self.state == State::Sending {
+                        if let Some(handle) = self.active_client {
+                            let mods = capture.modifier_state();
+                            let mods_event = ProtoEvent::Input(Event::Keyboard(
+                                KeyboardEvent::Modifiers {
+                                    depressed: mods,
+                                    latched: 0,
+                                    locked: 0,
+                                    group: 0,
+                                },
+                            ));
+                            if let Err(e) = self.conn.send(mods_event, handle).await {
+                                log::debug!("failed to send modifier heartbeat: {e}");
                             }
                         }
                     }

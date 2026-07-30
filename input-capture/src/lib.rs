@@ -215,6 +215,29 @@ impl InputCapture {
         keys.iter().all(|k| self.pressed_keys.contains(k))
     }
 
+    /// Returns the currently pressed modifier keys as an X11-style modifier
+    /// bitmask (`ShiftMask=1<<0`, `LockMask=1<<1`, `ControlMask=1<<2`,
+    /// `Mod1Mask=1<<3`, `Mod4Mask=1<<6`), or 0 if none are pressed.
+    ///
+    /// Used by the capture service to send periodic modifier-sync heartbeats
+    /// so a lost key-up event over UDP doesn't leave the peer with a stuck
+    /// modifier (e.g. Control stuck down on macOS turns every click into a
+    /// right-click).
+    pub fn modifier_state(&self) -> u32 {
+        let mut mods = 0u32;
+        for key in &self.pressed_keys {
+            mods |= match key {
+                scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => 1 << 0,
+                scancode::Linux::KeyCapsLock => 1 << 1,
+                scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => 1 << 2,
+                scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => 1 << 3,
+                scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => 1 << 6,
+                _ => 0,
+            };
+        }
+        mods
+    }
+
     fn update_pressed_keys(&mut self, key: u32, state: u8) {
         if let Ok(scancode) = scancode::Linux::try_from(key) {
             log::debug!("key: {key}, state: {state}, scancode: {scancode:?}");

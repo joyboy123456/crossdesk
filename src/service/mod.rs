@@ -10,6 +10,7 @@ use crate::{
     config::{Config, ConfigClient},
     connect::Connection,
     crypto,
+    discovery::DiscoveryResponder,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{DtlsListener, ListenerCreationError},
@@ -27,6 +28,10 @@ use std::{
     collections::HashSet,
     io,
     net::{IpAddr, SocketAddr},
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
 };
 use thiserror::Error;
 use tokio::signal;
@@ -79,6 +84,10 @@ pub struct Service {
 
     /// current port
     port: u16,
+    /// the port the discovery responder announces (mirrors `port`)
+    announced_port: Arc<AtomicU16>,
+    /// answers LAN discovery probes
+    discovery: DiscoveryResponder,
     /// the public key fingerprint for (D)TLS
     public_key_fingerprint: String,
     /// status of input capture (enabled / disabled)
@@ -120,6 +129,8 @@ impl Service {
         let port = config.port();
         let clipboard_enabled = config.clipboard_sync();
         let clipboard = ClipboardSync::new(clipboard_enabled);
+        let announced_port = Arc::new(AtomicU16::new(port));
+        let discovery = DiscoveryResponder::start(announced_port.clone()).await;
         let (frontend_events_tx, frontend_events_rx) = channel();
         let service = Self {
             config,
@@ -133,6 +144,8 @@ impl Service {
             frontend_events_tx,
             frontend_events_rx,
             port,
+            announced_port,
+            discovery,
             capture_status: Default::default(),
             emulation_status: Default::default(),
             incoming: Default::default(),
@@ -192,6 +205,8 @@ impl Service {
         }
 
         log::info!("terminating service ...");
+        log::debug!("terminating discovery responder ...");
+        self.discovery.terminate().await;
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
@@ -341,6 +356,7 @@ impl Service {
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
                     self.port = port;
+                    self.announced_port.store(port, Ordering::Relaxed);
                     self.notify_frontend(FrontendEvent::PortChanged(port, None));
                 }
                 Err(e) => self

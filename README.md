@@ -272,12 +272,14 @@ By default `cargo run` starts the CrossDesk frontend. You can also run the dedic
 
 The **设备** page adds a host or IP and places it to the left, right, top, or bottom of the local screen. Enabled remote screens can also be dragged between the four available slots.
 
+**添加设备** scans the LAN for running CrossDesk devices and prefills the selected device's hostname, IP and port; **手动添加** is still available for manual entry. Devices answer these discovery probes on the fixed UDP port `4243`, independent of the configured service port.
+
 On the remote device, use the **授权** page to approve the local device fingerprint. The local fingerprint is shown on the same page.
 It is of the form "aa:bb:cc:..."
 
 Authorized devices can be persisted using the configuration file (see [Configuration](#configuration)).
 
-If the device still can not be entered, make sure you have UDP port `4242` (or the one selected) opened up in your firewall.
+If the device still can not be entered, make sure you have UDP port `4242` (or the one selected) opened up in your firewall. For LAN discovery, UDP port `4243` must be reachable as well.
 </details>
 
 <details>

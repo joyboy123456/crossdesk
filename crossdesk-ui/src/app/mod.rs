@@ -30,7 +30,7 @@ use lan_mouse_ipc::{ClientHandle, FrontendEvent, FrontendRequest};
 use crate::macos_privacy::{self, PermissionState};
 use crate::{
     bridge::{Bridge, BridgeEvent},
-    model::{DeviceDraft, UiState, position_label},
+    model::{UiState, position_label},
     theme,
     tray::{TrayAction, TrayController},
 };
@@ -38,7 +38,7 @@ use crate::{
 const SIDEBAR_WIDTH: f32 = 200.0;
 const THEME_STORAGE_KEY: &str = "crossdesk_theme";
 
-use dialogs::{Editor, Notice, PendingPosition};
+use dialogs::{Editor, Notice, PendingPosition, ScanDialog};
 use fonts::install_fonts;
 use widgets::{icon, icon_button, nav_item};
 
@@ -57,6 +57,8 @@ pub struct CrossDeskApp {
     selected: Option<ClientHandle>,
     editor: Option<Editor>,
     editor_dialog_open: bool,
+    scan: Option<ScanDialog>,
+    scan_dialog_open: bool,
     delete_confirmation: Option<ClientHandle>,
     delete_dialog_open: bool,
     pending_positions: HashMap<ClientHandle, PendingPosition>,
@@ -136,6 +138,8 @@ impl CrossDeskApp {
             selected: None,
             editor: None,
             editor_dialog_open: false,
+            scan: None,
+            scan_dialog_open: false,
             delete_confirmation: None,
             delete_dialog_open: false,
             pending_positions: HashMap::new(),
@@ -365,11 +369,7 @@ impl CrossDeskApp {
                         )
                         .clicked()
                 {
-                    self.editor = Some(Editor {
-                        handle: None,
-                        draft: DeviceDraft::default(),
-                        error: None,
-                    });
+                    self.open_scanner(ui.ctx());
                 }
             });
         });
@@ -453,6 +453,7 @@ impl eframe::App for CrossDeskApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_window_lifecycle(ctx);
         self.drain_bridge();
+        self.drain_scan();
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 
@@ -508,11 +509,18 @@ impl eframe::App for CrossDeskApp {
 
         let ctx = ui.ctx().clone();
         // egui's animate_* calls request repaints while they run; the breathing
-        // pending dot and the notice lifecycle need explicit repaints instead.
-        if !self.pending_positions.is_empty() || self.notice.is_some() {
+        // pending dot, the scan spinner and the notice lifecycle need explicit
+        // repaints instead.
+        if !self.pending_positions.is_empty()
+            || self.notice.is_some()
+            || self.scan.as_ref().is_some_and(|scan| scan.scanning)
+        {
             ctx.request_repaint();
         }
 
+        // The scan dialog can open the editor; rendering it first lets the
+        // editor appear in the same frame instead of one frame late.
+        self.scan_dialog(&ctx);
         self.editor_dialog(&ctx);
         self.delete_dialog(&ctx);
         self.notice(&ctx);

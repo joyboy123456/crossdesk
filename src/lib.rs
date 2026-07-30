@@ -15,6 +15,7 @@ mod clipboard;
 mod config;
 mod connect;
 mod crypto;
+mod discovery;
 mod dns;
 mod emulation;
 mod emulation_test;
