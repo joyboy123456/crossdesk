@@ -3,17 +3,19 @@ use crate::{
     listen::{DtlsListener, ListenEvent, ListenerCreationError},
     observability::{self, Timestamp},
     position::{proto_to_emulation, proto_to_ipc},
+    service::control::ControlArbiter,
     task::{DropGuard, Receiver, Sender, TaskHandle, channel, send},
 };
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
 use lan_mouse_proto::{
-    CAPABILITY_CLIPBOARD_TEXT, CAPABILITY_ENTER_POSITION, ProtoEvent, WireEvent,
+    CAPABILITY_CLIPBOARD_TEXT, CAPABILITY_CONTROL_SESSION, CAPABILITY_ENTER_POSITION,
+    CONTROL_SESSION_CLOSE_BIT, ProtoEvent, WireEvent,
 };
 use std::{
-    cell::Cell,
-    collections::{HashMap, HashSet},
+    cell::{Cell, RefCell},
+    collections::HashMap,
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -31,6 +33,49 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(1);
 /// repeated connection attempts from the same unauthorized fingerprint are
 /// reported to the frontend at most once per this interval
 const REJECTED_REPORT_INTERVAL: Duration = Duration::from_secs(2);
+const LEAVE_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, Debug)]
+struct PendingLeave {
+    event: ProtoEvent,
+    serial: u32,
+    scoped: bool,
+    started_at: Instant,
+    last_sent: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionSerial {
+    Legacy,
+    Scoped(u32),
+}
+
+impl SessionSerial {
+    fn wire(self) -> u32 {
+        match self {
+            Self::Legacy => 0,
+            Self::Scoped(serial) => serial,
+        }
+    }
+
+    fn close_wire(self) -> u32 {
+        match self {
+            Self::Legacy => 0,
+            Self::Scoped(serial) => serial | CONTROL_SESSION_CLOSE_BIT,
+        }
+    }
+
+    fn matches_close(self, serial: u32) -> bool {
+        self.close_wire() == serial
+    }
+
+    fn valid(self) -> bool {
+        match self {
+            Self::Legacy => true,
+            Self::Scoped(serial) => serial != 0 && serial & CONTROL_SESSION_CLOSE_BIT == 0,
+        }
+    }
+}
 
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
@@ -55,6 +100,10 @@ pub(crate) enum EmulationEvent {
         pos: lan_mouse_ipc::Position,
         /// certificate fingerprint of the connection
         fingerprint: String,
+    },
+    /// A peer that was controlling this device ended its entered session.
+    Left {
+        addr: SocketAddr,
     },
     /// connection closed
     Disconnected {
@@ -85,6 +134,8 @@ pub(crate) enum EmulationEvent {
 enum EmulationRequest {
     Reenable,
     Release(SocketAddr, Option<f64>),
+    Disconnect(SocketAddr),
+    SetAcceptingControl(bool),
     ChangePort(u16),
     SetClipboard {
         text: Option<String>,
@@ -93,7 +144,12 @@ enum EmulationRequest {
 }
 
 impl Emulation {
-    pub(crate) fn new(backend: Option<input_emulation::Backend>, listener: DtlsListener) -> Self {
+    pub(crate) fn new(
+        backend: Option<input_emulation::Backend>,
+        listener: DtlsListener,
+        accepting_control: bool,
+        control_arbiter: ControlArbiter,
+    ) -> Self {
         let cancellation_token = CancellationToken::new();
         let emulation_proxy = EmulationProxy::new(backend, cancellation_token.child_token());
         let (request_tx, request_rx) = channel();
@@ -105,7 +161,10 @@ impl Emulation {
             event_tx,
             clipboard_text: None,
             cancellation_token: cancellation_token.clone(),
-            entered: HashSet::new(),
+            entered: HashMap::new(),
+            accepting_control,
+            control_arbiter,
+            pending_leaves: HashMap::new(),
         };
         let task = TaskHandle::new(cancellation_token, spawn_local(emulation_task.run()));
         Self {
@@ -120,6 +179,22 @@ impl Emulation {
             &self.request_tx,
             "leave notification",
             EmulationRequest::Release(addr, edge_ratio),
+        );
+    }
+
+    pub(crate) fn disconnect(&self, addr: SocketAddr) {
+        send(
+            &self.request_tx,
+            "controller disconnect",
+            EmulationRequest::Disconnect(addr),
+        );
+    }
+
+    pub(crate) fn set_accepting_control(&self, accepting: bool) {
+        send(
+            &self.request_tx,
+            "control acceptance",
+            EmulationRequest::SetAcceptingControl(accepting),
         );
     }
 
@@ -167,7 +242,16 @@ struct ListenTask {
     cancellation_token: CancellationToken,
     /// peers currently controlling this device (Enter accepted, no Leave
     /// yet); they are kicked with a Leave when emulation becomes unavailable
-    entered: HashSet<SocketAddr>,
+    entered: HashMap<SocketAddr, SessionSerial>,
+    /// Whether a new peer may begin controlling this device. Existing peers
+    /// may still retransmit Enter to recover a lost Ack.
+    accepting_control: bool,
+    /// synchronous direction ownership shared with the capture task
+    control_arbiter: ControlArbiter,
+    /// Leave packets are retried until the controlling peer confirms by Ack
+    /// or its reciprocal Leave. A single lost UDP datagram must not strand the
+    /// peer's cursor in Sending forever.
+    pending_leaves: HashMap<SocketAddr, PendingLeave>,
 }
 
 impl ListenTask {
@@ -188,45 +272,60 @@ impl ListenTask {
                                 log::trace!("{event} <-<-<-<-<- {addr}");
                                 match event {
                                     ProtoEvent::Enter(pos) => {
-                                        if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
-                                            if !self.reject_enter_if_emulation_unavailable(addr).await {
-                                                log::info!("releasing capture: {addr} entered this device");
-                                                send(&self.event_tx, "release notification", EmulationEvent::ReleaseNotify);
-                                                self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                                self.entered.insert(addr);
-                                                send(&self.event_tx, "peer entered", EmulationEvent::Entered{addr, pos: proto_to_ipc(pos), fingerprint});
-                                            }
-                                        }
+                                        self.handle_enter(addr, pos, None, SessionSerial::Legacy).await;
                                     }
                                     ProtoEvent::EnterAt { pos, ratio } => {
-                                        if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
-                                            if !self.reject_enter_if_emulation_unavailable(addr).await {
-                                                log::info!("releasing capture: {addr} entered this device (at {ratio:.3})");
-                                                send(&self.event_tx, "release notification", EmulationEvent::ReleaseNotify);
-                                                self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                                self.entered.insert(addr);
-                                                send(&self.event_tx, "peer entered", EmulationEvent::Entered{addr, pos: proto_to_ipc(pos), fingerprint});
-                                                // place the cursor where the remote cursor crossed
-                                                // the barrier. Deliberately not deduplicated by
-                                                // handle: repeated EnterAt only happens before the
-                                                // Ack is processed (no Motion in between), so
-                                                // re-placing is idempotent.
-                                                if ratio.is_finite() {
-                                                    self.emulation_proxy.enter(proto_to_emulation(pos), ratio.clamp(0.0, 1.0), addr);
+                                        self.handle_enter(
+                                            addr,
+                                            pos,
+                                            Some(ratio),
+                                            SessionSerial::Legacy,
+                                        ).await;
+                                    }
+                                    ProtoEvent::EnterSession { pos, serial, ratio } => {
+                                        self.handle_enter(
+                                            addr,
+                                            pos,
+                                            Some(ratio),
+                                            SessionSerial::Scoped(serial),
+                                        ).await;
+                                    }
+                                    ProtoEvent::Leave(serial)
+                                    | ProtoEvent::LeaveAt { serial, .. } => {
+                                        self.handle_leave(addr, serial).await;
+                                    }
+                                    ProtoEvent::Ack(serial) => {
+                                        if let Some(pending) = self.pending_leaves.get(&addr).copied() {
+                                            if pending.serial == serial {
+                                                self.pending_leaves.remove(&addr);
+                                                if !pending.scoped {
+                                                    self.listener.close_peer(addr).await;
                                                 }
                                             }
                                         }
                                     }
-                                    ProtoEvent::Leave(_) => {
-                                        self.entered.remove(&addr);
-                                        self.emulation_proxy.remove(addr);
-                                        self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                    }
                                     ProtoEvent::Input(event) => {
-                                        if input_allowed(&self.entered, addr) {
+                                        if input_allowed(
+                                            &self.entered,
+                                            addr,
+                                            SessionSerial::Legacy,
+                                        ) {
                                             self.emulation_proxy.consume(event, addr, received_at);
                                         } else {
                                             log::debug!("ignoring input from {addr} outside an entered session");
+                                        }
+                                    }
+                                    ProtoEvent::InputSession { serial, event } => {
+                                        if input_allowed(
+                                            &self.entered,
+                                            addr,
+                                            SessionSerial::Scoped(serial),
+                                        ) {
+                                            self.emulation_proxy.consume(event, addr, received_at);
+                                        } else {
+                                            log::debug!(
+                                                "ignoring stale scoped input from {addr} session {serial}"
+                                            );
                                         }
                                     }
                                     ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
@@ -234,7 +333,9 @@ impl ListenTask {
                                         self.listener.set_peer_capabilities(addr, capabilities);
                                         self.listener.reply(addr, ProtoEvent::Hello {
                                             commit: local_commit(),
-                                            capabilities: CAPABILITY_CLIPBOARD_TEXT | CAPABILITY_ENTER_POSITION,
+                                            capabilities: CAPABILITY_CLIPBOARD_TEXT
+                                                | CAPABILITY_ENTER_POSITION
+                                                | CAPABILITY_CONTROL_SESSION,
                                         }).await;
                                         if capabilities & CAPABILITY_CLIPBOARD_TEXT != 0 {
                                             if let Some(text) = self.clipboard_text.as_deref() {
@@ -266,9 +367,24 @@ impl ListenTask {
                         // controlling us, otherwise their cursor stays
                         // captured aiming at a black hole
                         if matches!(event, EmulationEvent::EmulationDisabled) {
-                            for addr in std::mem::take(&mut self.entered) {
+                            for (addr, session) in std::mem::take(&mut self.entered) {
                                 log::warn!("emulation became unavailable, kicking {addr}");
-                                self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                                let serial = session.close_wire();
+                                let leave = ProtoEvent::Leave(serial);
+                                self.listener.reply(addr, leave).await;
+                                self.pending_leaves.insert(
+                                    addr,
+                                    PendingLeave {
+                                        event: leave,
+                                        serial,
+                                        scoped: matches!(session, SessionSerial::Scoped(_)),
+                                        started_at: Instant::now(),
+                                        last_sent: Instant::now(),
+                                    },
+                                );
+                                self.emulation_proxy.remove(addr);
+                                self.control_arbiter.release_incoming();
+                                send(&self.event_tx, "peer left", EmulationEvent::Left { addr });
                             }
                         }
                         send(&self.event_tx, "emulation event", event)
@@ -281,13 +397,55 @@ impl ListenTask {
                     Some(EmulationRequest::Reenable) => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     Some(EmulationRequest::Release(addr, edge_ratio)) => {
+                        let session = self
+                            .entered
+                            .get(&addr)
+                            .copied()
+                            .unwrap_or(SessionSerial::Legacy);
+                        let serial = session.close_wire();
                         let event = match edge_ratio {
                             Some(ratio) if self.listener.peer_supports(addr, CAPABILITY_ENTER_POSITION) => {
-                                ProtoEvent::LeaveAt { serial: 0, ratio }
+                                ProtoEvent::LeaveAt { serial, ratio }
                             }
-                            _ => ProtoEvent::Leave(0),
+                            _ => ProtoEvent::Leave(serial),
                         };
-                        self.listener.reply(addr, event).await
+                        self.finish_incoming(addr);
+                        self.listener.reply(addr, event).await;
+                        self.pending_leaves.insert(
+                            addr,
+                            PendingLeave {
+                                event,
+                                serial,
+                                scoped: matches!(session, SessionSerial::Scoped(_)),
+                                started_at: Instant::now(),
+                                last_sent: Instant::now(),
+                            },
+                        );
+                    }
+                    Some(EmulationRequest::Disconnect(addr)) => {
+                        let session = self
+                            .entered
+                            .get(&addr)
+                            .copied()
+                            .unwrap_or(SessionSerial::Legacy);
+                        let serial = session.close_wire();
+                        if self.finish_incoming(addr) {
+                            let event = ProtoEvent::Leave(serial);
+                            self.listener.reply(addr, event).await;
+                            self.pending_leaves.insert(
+                                addr,
+                                PendingLeave {
+                                    event,
+                                    serial,
+                                    scoped: matches!(session, SessionSerial::Scoped(_)),
+                                    started_at: Instant::now(),
+                                    last_sent: Instant::now(),
+                                },
+                            );
+                        }
+                    }
+                    Some(EmulationRequest::SetAcceptingControl(accepting)) => {
+                        self.accepting_control = accepting;
                     }
                     Some(EmulationRequest::ChangePort(port)) => {
                         self.listener.request_port_change(port);
@@ -307,23 +465,189 @@ impl ListenTask {
                 },
                 _ = interval.tick() => {
                     let entered = &mut self.entered;
+                    let pending_leaves = &mut self.pending_leaves;
                     last_response.retain(|&addr,instant| {
                         if instant.elapsed() > PEER_TIMEOUT {
                             log::warn!("releasing keys: {addr} not responding!");
-                            entered.remove(&addr);
-                            self.emulation_proxy.remove(addr);
+                            if entered.remove(&addr).is_some() {
+                                self.emulation_proxy.remove(addr);
+                                self.control_arbiter.release_incoming();
+                            }
+                            pending_leaves.remove(&addr);
                             send(&self.event_tx, "peer disconnected", EmulationEvent::Disconnected { addr });
                             false
                         } else {
                             true
                         }
                     });
+
+                    let expired = self
+                        .pending_leaves
+                        .iter()
+                        .filter_map(|(&addr, pending)| {
+                            (pending.started_at.elapsed() >= LEAVE_ACK_TIMEOUT).then_some(addr)
+                        })
+                        .collect::<Vec<_>>();
+                    for addr in expired {
+                        log::warn!(
+                            "closing {addr}: Leave was not acknowledged within {LEAVE_ACK_TIMEOUT:?}"
+                        );
+                        self.pending_leaves.remove(&addr);
+                        last_response.remove(&addr);
+                        self.listener.close_peer(addr).await;
+                    }
+
+                    let retries = self
+                        .pending_leaves
+                        .iter_mut()
+                        .filter_map(|(&addr, pending)| {
+                            if pending.last_sent.elapsed() >= LIVENESS_CHECK_INTERVAL {
+                                pending.last_sent = Instant::now();
+                                Some((addr, pending.event))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    for (addr, event) in retries {
+                        self.listener.reply(addr, event).await;
+                    }
                 }
                 _ = self.cancellation_token.cancelled() => break,
             }
         }
         self.listener.terminate().await;
         self.emulation_proxy.terminate().await;
+    }
+
+    fn finish_incoming(&mut self, addr: SocketAddr) -> bool {
+        if self.entered.remove(&addr).is_none() {
+            return false;
+        }
+        // Invalidate the proxy generation synchronously before another
+        // direction can acquire the arbiter. Queued input from this session
+        // will then be discarded even if its FIFO Remove is still pending.
+        self.emulation_proxy.remove(addr);
+        self.control_arbiter.release_incoming();
+        send(&self.event_tx, "peer left", EmulationEvent::Left { addr });
+        true
+    }
+
+    async fn handle_leave(&mut self, addr: SocketAddr, serial: u32) {
+        let legacy_epoch_rollover = self
+            .pending_leaves
+            .get(&addr)
+            .is_some_and(|pending| !pending.scoped && pending.serial == serial);
+        if self
+            .pending_leaves
+            .get(&addr)
+            .is_some_and(|pending| pending.serial == serial)
+        {
+            self.pending_leaves.remove(&addr);
+        }
+        if self
+            .entered
+            .get(&addr)
+            .is_some_and(|session| session.matches_close(serial))
+        {
+            self.finish_incoming(addr);
+        }
+        // Ack even a stale Leave so its sender can stop retrying, but never
+        // let a mismatched generation tear down the current session.
+        self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
+        if legacy_epoch_rollover {
+            self.listener.close_peer(addr).await;
+        }
+    }
+
+    async fn handle_enter(
+        &mut self,
+        addr: SocketAddr,
+        pos: lan_mouse_proto::Position,
+        ratio: Option<f64>,
+        session: SessionSerial,
+    ) {
+        if !session.valid() {
+            log::warn!("rejecting invalid control-session serial from {addr}");
+            self.listener
+                .reply(addr, ProtoEvent::Leave(session.close_wire()))
+                .await;
+            return;
+        }
+        if let Some(pending) = self.pending_leaves.get(&addr).copied() {
+            // Without a protocol session id, an Enter received before the
+            // previous Leave handshake completes may be a delayed packet from
+            // the old session. Keep closing that session until Ack/Leave.
+            self.listener.reply(addr, pending.event).await;
+            return;
+        }
+        match enter_decision(&self.entered, self.accepting_control, addr, session) {
+            EnterDecision::Duplicate { ack } => {
+                // The sender retries Enter until its Ack arrives. A retry is
+                // synchronization only: do not release capture, recreate the
+                // emulation handle, or post another absolute edge movement.
+                self.listener.reply(addr, ProtoEvent::Ack(ack)).await;
+                return;
+            }
+            EnterDecision::Upgrade { ack } => {
+                self.entered.insert(addr, session);
+                self.listener.reply(addr, ProtoEvent::Ack(ack)).await;
+                return;
+            }
+            EnterDecision::Reject { leave } => {
+                log::warn!("rejecting enter from {addr}: this device is not accepting control");
+                self.listener.reply(addr, ProtoEvent::Leave(leave)).await;
+                return;
+            }
+            EnterDecision::Accept => {}
+        }
+
+        let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await else {
+            return;
+        };
+        if self
+            .reject_enter_if_emulation_unavailable(addr, session.wire())
+            .await
+        {
+            return;
+        }
+        if !self.control_arbiter.try_acquire_incoming() {
+            log::warn!("rejecting enter from {addr}: outgoing control owns the session");
+            self.listener
+                .reply(addr, ProtoEvent::Leave(session.close_wire()))
+                .await;
+            return;
+        }
+
+        match ratio {
+            Some(ratio) => {
+                log::info!("releasing capture: {addr} entered this device (at {ratio:.3})");
+            }
+            None => log::info!("releasing capture: {addr} entered this device"),
+        }
+        send(
+            &self.event_tx,
+            "release notification",
+            EmulationEvent::ReleaseNotify,
+        );
+        self.entered.insert(addr, session);
+        self.emulation_proxy.activate(addr);
+        self.listener
+            .reply(addr, ProtoEvent::Ack(session.wire()))
+            .await;
+        send(
+            &self.event_tx,
+            "peer entered",
+            EmulationEvent::Entered {
+                addr,
+                pos: proto_to_ipc(pos),
+                fingerprint,
+            },
+        );
+        if let Some(ratio) = ratio.filter(|ratio| ratio.is_finite()) {
+            self.emulation_proxy
+                .enter(proto_to_emulation(pos), ratio.clamp(0.0, 1.0), addr);
+        }
     }
 
     /// If input emulation is currently unavailable (no backend or missing
@@ -335,34 +659,88 @@ impl ListenTask {
     /// frozen until the connection dies.
     ///
     /// Returns true if the Enter was rejected.
-    async fn reject_enter_if_emulation_unavailable(&mut self, addr: SocketAddr) -> bool {
+    async fn reject_enter_if_emulation_unavailable(
+        &mut self,
+        addr: SocketAddr,
+        serial: u32,
+    ) -> bool {
         if self.emulation_proxy.emulation_active.get() {
             return false;
         }
         log::warn!("rejecting enter from {addr}: input emulation is unavailable");
-        self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+        let session = if serial == 0 {
+            SessionSerial::Legacy
+        } else {
+            SessionSerial::Scoped(serial)
+        };
+        self.listener
+            .reply(addr, ProtoEvent::Leave(session.close_wire()))
+            .await;
         true
     }
 }
 
-fn input_allowed(entered: &HashSet<SocketAddr>, addr: SocketAddr) -> bool {
-    entered.contains(&addr)
+fn input_allowed(
+    entered: &HashMap<SocketAddr, SessionSerial>,
+    addr: SocketAddr,
+    session: SessionSerial,
+) -> bool {
+    entered.get(&addr) == Some(&session)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnterDecision {
+    Accept,
+    Duplicate { ack: u32 },
+    Upgrade { ack: u32 },
+    Reject { leave: u32 },
+}
+
+fn enter_decision(
+    entered: &HashMap<SocketAddr, SessionSerial>,
+    accepting_control: bool,
+    addr: SocketAddr,
+    incoming: SessionSerial,
+) -> EnterDecision {
+    if let Some(current) = entered.get(&addr).copied() {
+        if current == incoming {
+            EnterDecision::Duplicate {
+                ack: incoming.wire(),
+            }
+        } else if current == SessionSerial::Legacy && matches!(incoming, SessionSerial::Scoped(_)) {
+            EnterDecision::Upgrade {
+                ack: incoming.wire(),
+            }
+        } else {
+            EnterDecision::Reject {
+                leave: incoming.close_wire(),
+            }
+        }
+    } else if accepting_control && entered.is_empty() {
+        EnterDecision::Accept
+    } else {
+        EnterDecision::Reject {
+            leave: incoming.close_wire(),
+        }
+    }
 }
 
 /// proxy handling the actual input emulation,
 /// discarding events when it is disabled
 pub(crate) struct EmulationProxy {
     emulation_active: Rc<Cell<bool>>,
+    sessions: Rc<RefCell<HashMap<SocketAddr, u64>>>,
+    next_generation: Cell<u64>,
     request_tx: Sender<ProxyRequest>,
     event_rx: Receiver<EmulationEvent>,
     task: TaskHandle,
 }
 
 enum ProxyRequest {
-    Input(Event, SocketAddr, Timestamp),
+    Input(Event, SocketAddr, u64, Timestamp),
     /// place the cursor at `ratio` along the entered edge
-    Enter(input_emulation::Position, f64, SocketAddr),
-    Remove(SocketAddr),
+    Enter(input_emulation::Position, f64, SocketAddr, u64),
+    Remove(SocketAddr, u64),
     Reenable,
 }
 
@@ -382,6 +760,7 @@ impl EmulationProxy {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_active = Rc::new(Cell::new(false));
+        let sessions = Rc::new(RefCell::new(HashMap::new()));
         let emulation_task = EmulationTask {
             backend,
             cancellation_token: cancellation_token.clone(),
@@ -389,10 +768,13 @@ impl EmulationProxy {
             event_tx,
             handles: Default::default(),
             next_id: 0,
+            sessions: sessions.clone(),
         };
         let task = TaskHandle::new(cancellation_token, spawn_local(emulation_task.run()));
         Self {
             emulation_active,
+            sessions,
+            next_generation: Cell::new(0),
             request_tx,
             task,
             event_rx,
@@ -414,31 +796,51 @@ impl EmulationProxy {
 
     fn consume(&self, event: Event, addr: SocketAddr, received_at: Timestamp) {
         // ignore events if emulation is currently disabled
-        if self.emulation_active.get() {
-            observability::injection_queue_push();
-            send(
-                &self.request_tx,
-                "input event",
-                ProxyRequest::Input(event, addr, received_at),
-            );
-        } else {
+        if !self.emulation_active.get() {
             observability::record_emulation_inactive_drop(&event);
+            return;
         }
+        let Some(generation) = self.sessions.borrow().get(&addr).copied() else {
+            observability::record_emulation_inactive_drop(&event);
+            return;
+        };
+        observability::injection_queue_push();
+        send(
+            &self.request_tx,
+            "input event",
+            ProxyRequest::Input(event, addr, generation, received_at),
+        );
     }
 
     fn enter(&self, pos: input_emulation::Position, ratio: f64, addr: SocketAddr) {
         // ignore if emulation is currently disabled, same as input events
-        if self.emulation_active.get() {
-            send(
-                &self.request_tx,
-                "enter event",
-                ProxyRequest::Enter(pos, ratio, addr),
-            );
+        if !self.emulation_active.get() {
+            return;
         }
+        let Some(generation) = self.sessions.borrow().get(&addr).copied() else {
+            return;
+        };
+        send(
+            &self.request_tx,
+            "enter event",
+            ProxyRequest::Enter(pos, ratio, addr, generation),
+        );
+    }
+
+    fn activate(&self, addr: SocketAddr) {
+        let generation = self.next_generation.get();
+        self.next_generation.set(generation.wrapping_add(1));
+        self.sessions.borrow_mut().insert(addr, generation);
     }
 
     fn remove(&self, addr: SocketAddr) {
-        send(&self.request_tx, "peer removal", ProxyRequest::Remove(addr));
+        if let Some(generation) = self.sessions.borrow_mut().remove(&addr) {
+            send(
+                &self.request_tx,
+                "peer removal",
+                ProxyRequest::Remove(addr, generation),
+            );
+        }
     }
 
     fn reenable(&self) {
@@ -459,8 +861,9 @@ struct EmulationTask {
     cancellation_token: CancellationToken,
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
-    handles: HashMap<SocketAddr, EmulationHandle>,
+    handles: HashMap<SocketAddr, (EmulationHandle, u64)>,
     next_id: EmulationHandle,
+    sessions: Rc<RefCell<HashMap<SocketAddr, u64>>>,
 }
 
 impl EmulationTask {
@@ -488,7 +891,15 @@ impl EmulationTask {
                         observability::record_emulation_inactive_drop(&event);
                     }
                     ProxyRequest::Enter(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Remove(addr, generation) => {
+                        if self
+                            .handles
+                            .get(&addr)
+                            .is_some_and(|(_, current)| *current == generation)
+                        {
+                            self.handles.remove(&addr);
+                        }
+                    }
                 }
             }
         }
@@ -538,24 +949,28 @@ impl EmulationTask {
         &mut self,
         emulation: &mut InputEmulation,
         addr: SocketAddr,
+        generation: u64,
     ) -> EmulationHandle {
-        match self.handles.get(&addr) {
-            Some(&handle) => handle,
-            None => {
-                let handle = self.next_id;
-                self.next_id += 1;
-                emulation.create(handle).await;
-                self.handles.insert(addr, handle);
-                handle
+        if let Some(&(handle, current)) = self.handles.get(&addr) {
+            if current == generation {
+                return handle;
             }
+            self.handles.remove(&addr);
+            emulation.destroy(handle).await;
         }
+
+        let handle = self.next_id;
+        self.next_id += 1;
+        emulation.create(handle).await;
+        self.handles.insert(addr, (handle, generation));
+        handle
     }
 
     async fn create_clients(
         &mut self,
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
-        for handle in self.handles.values() {
+        for (handle, _) in self.handles.values() {
             select! {
                 _ = emulation.create(*handle) => {},
                 _ = self.cancellation_token.cancelled() => return Ok(()),
@@ -577,25 +992,46 @@ impl EmulationTask {
                     };
                     request.record_dequeued();
                     match request {
-                    ProxyRequest::Input(event, addr, received_at) => {
-                        let handle = self.get_or_create_handle(&mut *emulation, addr).await;
+                    ProxyRequest::Input(event, addr, generation, received_at) => {
+                        if !self.session_is_current(addr, generation) {
+                            observability::record_emulation_inactive_drop(&event);
+                            continue;
+                        }
+                        let handle = self
+                            .get_or_create_handle(&mut *emulation, addr, generation)
+                            .await;
                         let result = emulation.consume(event, handle).await;
                         observability::record_receive_to_inject(received_at);
                         result?;
                     },
-                    ProxyRequest::Enter(pos, ratio, addr) => {
-                        let handle = self.get_or_create_handle(&mut *emulation, addr).await;
+                    ProxyRequest::Enter(pos, ratio, addr, generation) => {
+                        if !self.session_is_current(addr, generation) {
+                            continue;
+                        }
+                        let handle = self
+                            .get_or_create_handle(&mut *emulation, addr, generation)
+                            .await;
                         emulation.enter(handle, pos, ratio).await;
                     }
-                    ProxyRequest::Remove(addr) => {
-                        if let Some(handle) = self.handles.remove(&addr) {
-                            emulation.destroy(handle).await;
+                    ProxyRequest::Remove(addr, generation) => {
+                        if let Some((handle, current)) = self.handles.get(&addr).copied() {
+                            if current == generation {
+                                self.handles.remove(&addr);
+                                emulation.destroy(handle).await;
+                            }
                         }
                     }
                     ProxyRequest::Reenable => continue,
                 }},
             }
         }
+    }
+
+    fn session_is_current(&self, addr: SocketAddr, generation: u64) -> bool {
+        self.sessions
+            .borrow()
+            .get(&addr)
+            .is_some_and(|current| *current == generation)
     }
 }
 
@@ -606,13 +1042,58 @@ mod tests {
     #[test]
     fn input_is_accepted_only_while_peer_is_entered() {
         let addr = "127.0.0.1:4242".parse().expect("valid socket address");
-        let mut entered = HashSet::new();
+        let mut entered = HashMap::new();
 
-        assert!(!input_allowed(&entered, addr));
-        entered.insert(addr);
-        assert!(input_allowed(&entered, addr));
+        assert!(!input_allowed(&entered, addr, SessionSerial::Legacy));
+        entered.insert(addr, SessionSerial::Legacy);
+        assert!(input_allowed(&entered, addr, SessionSerial::Legacy));
+        assert!(!input_allowed(&entered, addr, SessionSerial::Scoped(1)));
+        entered.insert(addr, SessionSerial::Scoped(7));
+        assert!(input_allowed(&entered, addr, SessionSerial::Scoped(7)));
+        assert!(!input_allowed(&entered, addr, SessionSerial::Scoped(6)));
+        assert!(!input_allowed(&entered, addr, SessionSerial::Legacy));
         entered.remove(&addr);
-        assert!(!input_allowed(&entered, addr));
+        assert!(!input_allowed(&entered, addr, SessionSerial::Legacy));
+    }
+
+    #[test]
+    fn only_one_controller_can_enter_and_retries_are_idempotent() {
+        let first = "127.0.0.1:4242".parse().expect("valid socket address");
+        let second = "127.0.0.1:4243".parse().expect("valid socket address");
+        let mut entered = HashMap::new();
+
+        assert_eq!(
+            enter_decision(&entered, true, first, SessionSerial::Legacy),
+            EnterDecision::Accept
+        );
+        entered.insert(first, SessionSerial::Legacy);
+        assert_eq!(
+            enter_decision(&entered, true, first, SessionSerial::Legacy),
+            EnterDecision::Duplicate { ack: 0 }
+        );
+        assert_eq!(
+            enter_decision(&entered, true, first, SessionSerial::Scoped(7)),
+            EnterDecision::Upgrade { ack: 7 }
+        );
+        entered.insert(first, SessionSerial::Scoped(7));
+        assert_eq!(
+            enter_decision(&entered, true, first, SessionSerial::Scoped(6)),
+            EnterDecision::Reject {
+                leave: CONTROL_SESSION_CLOSE_BIT | 6,
+            }
+        );
+        assert_eq!(
+            enter_decision(&entered, true, second, SessionSerial::Scoped(9)),
+            EnterDecision::Reject {
+                leave: CONTROL_SESSION_CLOSE_BIT | 9,
+            }
+        );
+        assert_eq!(
+            enter_decision(&HashMap::new(), false, first, SessionSerial::Scoped(11),),
+            EnterDecision::Reject {
+                leave: CONTROL_SESSION_CLOSE_BIT | 11,
+            }
+        );
     }
 
     /// A dummy backend accepts every event and throws it away. If the service
@@ -634,6 +1115,7 @@ mod tests {
             event_tx,
             handles: Default::default(),
             next_id: 0,
+            sessions: Default::default(),
         };
         task.do_emulation().await.expect("dummy emulation session");
 

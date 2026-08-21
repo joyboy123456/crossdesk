@@ -134,7 +134,14 @@ fn run_worker(
                         return;
                     }
                     emit(&event_tx, BridgeEvent::Connected, &overflowed, &ctx);
-                    if frontend_tx.request(FrontendRequest::Sync).await.is_err() {
+                    let mut initialized = true;
+                    for request in initial_requests() {
+                        if frontend_tx.request(request).await.is_err() {
+                            initialized = false;
+                            break;
+                        }
+                    }
+                    if !initialized {
                         continue;
                     }
                     retry = Duration::from_millis(200);
@@ -202,6 +209,10 @@ fn run_worker(
     });
 }
 
+fn initial_requests() -> [FrontendRequest; 2] {
+    [FrontendRequest::Sync, FrontendRequest::GetControlMode]
+}
+
 fn discard_pending_requests(request_rx: &Receiver<FrontendRequest>) -> usize {
     let mut discarded = 0;
     loop {
@@ -266,5 +277,13 @@ mod tests {
             .expect("test request receiver");
         assert_eq!(discard_pending_requests(requests), 2);
         assert!(bridge.try_test_request().is_none());
+    }
+
+    #[test]
+    fn connection_initialization_syncs_before_negotiating_control_events() {
+        assert_eq!(
+            initial_requests(),
+            [FrontendRequest::Sync, FrontendRequest::GetControlMode]
+        );
     }
 }

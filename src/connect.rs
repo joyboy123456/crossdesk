@@ -7,8 +7,9 @@ use crate::{
 };
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{
-    CAPABILITY_CLIPBOARD_TEXT, CAPABILITY_ENTER_POSITION, MAX_EVENT_SIZE, MAX_WIRE_SIZE,
-    ProtoEvent, ProtocolError, WireEvent, decode_wire_event, encode_clipboard_text,
+    CAPABILITY_CLIPBOARD_TEXT, CAPABILITY_CONTROL_SESSION, CAPABILITY_ENTER_POSITION,
+    MAX_EVENT_SIZE, MAX_WIRE_SIZE, ProtoEvent, ProtocolError, WireEvent, decode_wire_event,
+    encode_clipboard_text,
 };
 use std::{
     cell::RefCell,
@@ -33,6 +34,8 @@ use webrtc_dtls::{
     crypto::Certificate,
 };
 use webrtc_util::Conn;
+
+type ArcConn = Arc<dyn Conn + Send + Sync>;
 
 #[derive(Debug, Error)]
 pub(crate) enum ConnectionError {
@@ -62,6 +65,15 @@ const PINGS_PER_ROUND: usize = 4;
 
 /// delay between two pings of the same round
 const PING_INTERVAL: Duration = Duration::from_millis(500);
+
+fn local_hello() -> ProtoEvent {
+    ProtoEvent::Hello {
+        commit: local_commit(),
+        capabilities: CAPABILITY_CLIPBOARD_TEXT
+            | CAPABILITY_ENTER_POSITION
+            | CAPABILITY_CONTROL_SESSION,
+    }
+}
 
 #[derive(Default)]
 struct PingState {
@@ -156,29 +168,54 @@ pub(crate) struct Connection {
 #[derive(Clone)]
 struct ConnectionContext {
     client_manager: ClientManager,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
+    conns: Rc<Mutex<HashMap<SocketAddr, ArcConn>>>,
     recv_tx: Sender<(ClientHandle, WireEvent)>,
-    ping_state: Rc<RefCell<PingState>>,
     peer_capabilities: PeerCapabilities,
 }
 
 impl ConnectionContext {
     /// look up the open connection to `addr`, if any
-    async fn conn(&self, addr: SocketAddr) -> Option<Arc<dyn Conn + Send + Sync>> {
+    async fn conn(&self, addr: SocketAddr) -> Option<ArcConn> {
         self.conns.lock().await.get(&addr).cloned()
     }
 
+    async fn is_current(&self, handle: ClientHandle, addr: SocketAddr, expected: &ArcConn) -> bool {
+        if self.client_manager.active_addr(handle) != Some(addr) {
+            return false;
+        }
+        self.conns
+            .lock()
+            .await
+            .get(&addr)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+    }
+
     /// forget the connection to `addr` and everything we learned about it
-    async fn disconnect(&self, handle: ClientHandle, addr: SocketAddr) {
-        log::warn!("client ({handle}) @ {addr} connection closed");
-        let active: Vec<SocketAddr> = {
+    async fn disconnect(&self, handle: ClientHandle, addr: SocketAddr, expected: &ArcConn) {
+        let (removed, active): (bool, Vec<SocketAddr>) = {
             let mut conns = self.conns.lock().await;
-            conns.remove(&addr);
-            conns.keys().copied().collect()
+            let removed = conns
+                .get(&addr)
+                .is_some_and(|current| Arc::ptr_eq(current, expected));
+            if removed {
+                conns.remove(&addr);
+            }
+            (removed, conns.keys().copied().collect())
         };
-        self.client_manager.set_active_addr(handle, None);
-        self.client_manager.set_peer_commit(handle, None);
-        self.peer_capabilities.remove(addr);
+        if !removed {
+            log::debug!("ignoring stale disconnect for client ({handle}) @ {addr}");
+            return;
+        }
+        log::warn!("client ({handle}) @ {addr} connection closed");
+        if self.client_manager.active_addr(handle) == Some(addr) {
+            self.peer_capabilities.remove(addr);
+            self.client_manager.set_active_addr(handle, None);
+            self.client_manager.set_peer_commit(handle, None);
+        } else {
+            // A newer path for this handle is already active. Only discard
+            // metadata belonging to the stale address.
+            self.peer_capabilities.remove(addr);
+        }
         log::info!("active connections: {active:?}");
     }
 }
@@ -194,7 +231,6 @@ impl Connection {
                 client_manager,
                 conns: Default::default(),
                 recv_tx,
-                ping_state: Default::default(),
                 peer_capabilities: Default::default(),
             },
         }
@@ -240,7 +276,7 @@ impl Connection {
                         // fails; reporting success here would strand the
                         // pointer on a peer we can no longer reach.
                         log::warn!("client {handle} failed to send: {e}");
-                        self.ctx.disconnect(handle, addr).await;
+                        self.ctx.disconnect(handle, addr, &conn).await;
                         return Err(e.into());
                     }
                 }
@@ -260,6 +296,20 @@ impl Connection {
             ));
         }
         Err(ConnectionError::NotConnected)
+    }
+
+    /// Close the transport for a client whose control-session handshake did
+    /// not converge. A fresh DTLS connection prevents delayed datagrams from
+    /// the abandoned session being mistaken for a new one.
+    pub(crate) async fn close(&self, handle: ClientHandle) {
+        let Some(addr) = self.ctx.client_manager.active_addr(handle) else {
+            return;
+        };
+        let Some(conn) = self.ctx.conn(addr).await else {
+            return;
+        };
+        let _ = conn.close().await;
+        self.ctx.disconnect(handle, addr, &conn).await;
     }
 
     pub(crate) async fn send_clipboard(
@@ -285,7 +335,7 @@ impl Connection {
         let packet = encode_clipboard_text(text)?;
         if let Err(error) = conn.send(&packet).await {
             log::warn!("client {handle} failed to send clipboard text: {error}");
-            self.ctx.disconnect(handle, addr).await;
+            self.ctx.disconnect(handle, addr, &conn).await;
             return Err(error.into());
         }
         log::debug!("sent clipboard text to {addr} ({} bytes)", text.len());
@@ -318,7 +368,7 @@ impl Connection {
             if let Err(error) = conn.send(&packet).await {
                 log::warn!("failed to send clipboard text to {addr}: {error}");
                 if let Some(handle) = self.ctx.client_manager.get_client(addr) {
-                    self.ctx.disconnect(handle, addr).await;
+                    self.ctx.disconnect(handle, addr, &conn).await;
                 }
             }
         }
@@ -352,8 +402,30 @@ async fn connect_to_handle(
             }
         };
         log::info!("client ({handle}) connected @ {addr}");
+        let previous_addr = context.client_manager.active_addr(handle);
+        let replaced = {
+            let mut conns = context.conns.lock().await;
+            let mut replaced = Vec::new();
+            if let Some(previous_addr) = previous_addr {
+                if previous_addr != addr {
+                    if let Some(previous) = conns.remove(&previous_addr) {
+                        replaced.push(previous);
+                    }
+                    context.peer_capabilities.remove(previous_addr);
+                }
+            }
+            if let Some(previous) = conns.insert(addr, conn.clone()) {
+                replaced.push(previous);
+            }
+            replaced
+        };
+        for previous in replaced {
+            let _ = previous.close().await;
+        }
+        // Capabilities belong to the DTLS epoch, not merely the remote
+        // address. The peer may have restarted or downgraded in place.
+        context.peer_capabilities.remove(addr);
         context.client_manager.set_active_addr(handle, Some(addr));
-        context.conns.lock().await.insert(addr, conn.clone());
         connecting.lock().await.remove(&handle);
 
         // Best-effort version handshake. Send our commit hash once
@@ -361,20 +433,22 @@ async fn connect_to_handle(
         // mirrors a Hello back so the receive loop can populate
         // `peer_commit`. Old peers will silently skip this event
         // per the forward-compat handler in [`receive_loop`].
-        let (buf, len) = ProtoEvent::Hello {
-            commit: local_commit(),
-            capabilities: CAPABILITY_CLIPBOARD_TEXT | CAPABILITY_ENTER_POSITION,
-        }
-        .into();
+        let (buf, len) = local_hello().into();
         if let Err(e) = conn.send(&buf[..len]).await {
             log::debug!("hello send to {addr} failed: {e}");
         }
 
         // poll connection for active
-        spawn_local(ping_pong(addr, conn.clone(), context.ping_state.clone()));
+        let ping_state = Rc::new(RefCell::new(PingState::default()));
+        spawn_local(ping_pong(
+            addr,
+            conn.clone(),
+            ping_state.clone(),
+            context.peer_capabilities.clone(),
+        ));
 
         // receiver
-        spawn_local(receive_loop(handle, addr, conn, context));
+        spawn_local(receive_loop(handle, addr, conn, context, ping_state));
         return Ok(());
     }
     connecting.lock().await.remove(&handle);
@@ -385,8 +459,15 @@ async fn ping_pong(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     ping_state: Rc<RefCell<PingState>>,
+    peer_capabilities: PeerCapabilities,
 ) {
     loop {
+        if !peer_capabilities.known(addr) {
+            let (hello, len) = local_hello().into();
+            if let Err(error) = conn.send(&hello[..len]).await {
+                log::debug!("hello retry to {addr} failed: {error}");
+            }
+        }
         let (buf, len) = ProtoEvent::Ping.into();
 
         // at least one ping of the round must be answered
@@ -413,11 +494,16 @@ async fn ping_pong(
 async fn receive_loop(
     handle: ClientHandle,
     addr: SocketAddr,
-    conn: Arc<dyn Conn + Send + Sync>,
+    conn: ArcConn,
     context: ConnectionContext,
+    ping_state: Rc<RefCell<PingState>>,
 ) {
     let mut buf = vec![0u8; MAX_WIRE_SIZE];
     while let Ok(len) = conn.recv(&mut buf).await {
+        if !context.is_current(handle, addr, &conn).await {
+            log::debug!("ignoring packet from stale connection for client ({handle}) @ {addr}");
+            continue;
+        }
         match decode_wire_event(&buf[..len]) {
             Ok(WireEvent::Protocol(event)) => {
                 log::trace!("{addr} <==<==<== {event}");
@@ -425,7 +511,7 @@ async fn receive_loop(
                     ProtoEvent::Pong(b) => {
                         context.client_manager.set_active_addr(handle, Some(addr));
                         context.client_manager.set_alive(handle, b);
-                        context.ping_state.borrow_mut().response(addr);
+                        ping_state.borrow_mut().response(addr);
                     }
                     ProtoEvent::Hello {
                         commit,
@@ -452,5 +538,5 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    context.disconnect(handle, addr).await;
+    context.disconnect(handle, addr, &conn).await;
 }

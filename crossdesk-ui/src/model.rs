@@ -4,7 +4,8 @@ use std::{
 };
 
 use lan_mouse_ipc::{
-    ClientConfig, ClientHandle, ClientState, DEFAULT_PORT, FrontendEvent, Position, Status,
+    ClientConfig, ClientHandle, ClientState, ControlMode, ControlState, DEFAULT_PORT,
+    FrontendEvent, Position, Status,
 };
 
 #[derive(Clone, Debug)]
@@ -25,6 +26,8 @@ pub struct UiState {
     pub emulation_status: Status,
     pub clipboard_enabled: bool,
     pub clipboard_available: bool,
+    pub control_mode: ControlMode,
+    pub control_state: ControlState,
 }
 
 impl UiState {
@@ -76,6 +79,8 @@ impl UiState {
                 self.clipboard_enabled = enabled;
                 self.clipboard_available = available;
             }
+            FrontendEvent::ControlMode(mode) => self.control_mode = mode,
+            FrontendEvent::ControlState(state) => self.control_state = state,
             FrontendEvent::ConnectionAttempt { fingerprint } => {
                 if !self.pending_authorizations.contains(&fingerprint) {
                     self.pending_authorizations.push(fingerprint);
@@ -344,6 +349,36 @@ mod tests {
 
         state.apply(FrontendEvent::Deleted(4));
         assert!(state.clients.is_empty());
+    }
+
+    #[test]
+    fn state_reducer_tracks_control_mode_and_mutually_exclusive_role() {
+        let mut state = UiState::new();
+        assert_eq!(state.control_mode, ControlMode::Bidirectional);
+        assert_eq!(state.control_state, ControlState::Idle);
+
+        state.apply(FrontendEvent::ControlMode(ControlMode::ReceiveOnly));
+        state.apply(FrontendEvent::ControlState(ControlState::ReadyToReceive));
+        assert_eq!(state.control_mode, ControlMode::ReceiveOnly);
+        assert_eq!(state.control_state, ControlState::ReadyToReceive);
+
+        state.apply(FrontendEvent::ControlState(ControlState::Controlling {
+            handle: 9,
+        }));
+        assert_eq!(state.control_state, ControlState::Controlling { handle: 9 });
+
+        let addr = "192.168.1.42:4242".parse().expect("valid socket address");
+        state.apply(FrontendEvent::ControlState(ControlState::ControlledBy {
+            addr,
+            fingerprint: "aa:bb".into(),
+        }));
+        assert_eq!(
+            state.control_state,
+            ControlState::ControlledBy {
+                addr,
+                fingerprint: "aa:bb".into(),
+            }
+        );
     }
 
     #[test]

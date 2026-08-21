@@ -129,6 +129,8 @@ pub struct InputCapture {
     capture: Box<dyn Capture>,
     /// keys pressed by active capture
     pressed_keys: HashSet<scancode::Linux>,
+    /// latest modifier snapshot supplied by the capture backend
+    modifier_state: (u32, u32, u32, u32),
     /// map from position to ids
     position_map: HashMap<Position, Vec<CaptureHandle>>,
     /// map from id to position
@@ -177,6 +179,7 @@ impl InputCapture {
     /// barrier edge the cursor should reappear (normalized, top/left = 0.0)
     pub async fn release(&mut self, edge_ratio: Option<f64>) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
+        self.modifier_state = (0, 0, 0, 0);
         self.capture.release(edge_ratio).await
     }
 
@@ -207,6 +210,7 @@ impl InputCapture {
             pending: Default::default(),
             position_map: Default::default(),
             pressed_keys: HashSet::new(),
+            modifier_state: (0, 0, 0, 0),
         })
     }
 
@@ -215,27 +219,14 @@ impl InputCapture {
         keys.iter().all(|k| self.pressed_keys.contains(k))
     }
 
-    /// Returns the currently pressed modifier keys as an X11-style modifier
-    /// bitmask (`ShiftMask=1<<0`, `LockMask=1<<1`, `ControlMask=1<<2`,
-    /// `Mod1Mask=1<<3`, `Mod4Mask=1<<6`), or 0 if none are pressed.
+    /// Returns the latest `(depressed, latched, locked, group)` snapshot.
     ///
     /// Used by the capture service to send periodic modifier-sync heartbeats
     /// so a lost key-up event over UDP doesn't leave the peer with a stuck
     /// modifier (e.g. Control stuck down on macOS turns every click into a
     /// right-click).
-    pub fn modifier_state(&self) -> u32 {
-        let mut mods = 0u32;
-        for key in &self.pressed_keys {
-            mods |= match key {
-                scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => 1 << 0,
-                scancode::Linux::KeyCapsLock => 1 << 1,
-                scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => 1 << 2,
-                scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => 1 << 3,
-                scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => 1 << 6,
-                _ => 0,
-            };
-        }
-        mods
+    pub fn modifier_state(&self) -> (u32, u32, u32, u32) {
+        self.modifier_state
     }
 
     fn update_pressed_keys(&mut self, key: u32, state: u8) {
@@ -245,6 +236,23 @@ impl InputCapture {
                 1 => self.pressed_keys.insert(scancode),
                 _ => self.pressed_keys.remove(&scancode),
             };
+        }
+    }
+
+    fn track_input_state(&mut self, event: CaptureEvent) {
+        match event {
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) => {
+                self.update_pressed_keys(key, state);
+            }
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed,
+                latched,
+                locked,
+                group,
+            })) => {
+                self.modifier_state = (depressed, latched, locked, group);
+            }
+            _ => {}
         }
     }
 }
@@ -275,10 +283,9 @@ impl Stream for InputCapture {
             Err(e) => return Poll::Ready(Some(Err(e))),
         };
 
-        // handle key presses
-        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
-            self.update_pressed_keys(key, state);
-        }
+        // Track key presses for release recovery and preserve the backend's
+        // modifier snapshot verbatim for heartbeat synchronization.
+        self.track_input_state(event);
 
         let len = self
             .position_map
@@ -381,4 +388,39 @@ async fn create(
         }
     }
     Err(CaptureCreationError::NoAvailableBackend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn caps_lock_pulse_does_not_remain_pressed_and_locked_state_is_cached() {
+        let mut capture = InputCapture::new(Some(Backend::Dummy))
+            .await
+            .expect("dummy capture");
+        let key = scancode::Linux::KeyCapsLock as u32;
+
+        capture.track_input_state(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key,
+            state: 1,
+        })));
+        capture.track_input_state(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key,
+            state: 0,
+        })));
+        capture.track_input_state(CaptureEvent::Input(Event::Keyboard(
+            KeyboardEvent::Modifiers {
+                depressed: 0,
+                latched: 0,
+                locked: 1 << 1,
+                group: 0,
+            },
+        )));
+
+        assert!(capture.take_pressed_keys().is_empty());
+        assert_eq!(capture.modifier_state(), (0, 0, 1 << 1, 0));
+    }
 }

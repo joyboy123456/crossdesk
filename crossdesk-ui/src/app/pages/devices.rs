@@ -6,7 +6,7 @@ use eframe::egui::{
     self, Align, Align2, CornerRadius, CursorIcon, FontId, Frame, Id, Layout, Pos2, Rect, RichText,
     Sense, Stroke, StrokeKind, Vec2, WidgetInfo, WidgetType,
 };
-use lan_mouse_ipc::FrontendRequest;
+use lan_mouse_ipc::{ControlState, FrontendRequest};
 
 use crate::app::CrossDeskApp;
 use crate::app::dialogs::{Editor, PendingPosition};
@@ -48,7 +48,13 @@ impl CrossDeskApp {
             CornerRadius::same(theme::CANVAS_RADIUS),
             palette.bg_canvas,
         );
-        theme::radial_glow(&painter, canvas.center(), palette.glow);
+        theme::dot_grid(
+            &painter,
+            canvas.shrink(8.0),
+            palette.border.gamma_multiply(0.5),
+            22.0,
+        );
+        theme::ambient_glow(&painter, canvas.shrink(20.0), palette);
         painter.rect_stroke(
             canvas,
             CornerRadius::same(theme::CANVAS_RADIUS),
@@ -256,6 +262,10 @@ impl CrossDeskApp {
     fn device_row(&mut self, ui: &mut egui::Ui, client: &UiClient) {
         let palette = theme::palette(ui);
         let selected = self.selected == Some(client.handle);
+        let is_controlling = matches!(
+            &self.state.control_state,
+            ControlState::Controlling { handle } if *handle == client.handle
+        );
         let selected_t = ui.ctx().animate_bool_with_time(
             Id::new(("device-row-selected", client.handle)),
             selected,
@@ -282,7 +292,9 @@ impl CrossDeskApp {
                     {
                         self.selected = Some(client.handle);
                     }
-                    let status = if !client.state.active {
+                    let status = if is_controlling {
+                        (palette.accent, "正在控制")
+                    } else if !client.state.active {
                         (palette.text_muted, "已停用")
                     } else if client.state.alive {
                         (palette.success, "在线")

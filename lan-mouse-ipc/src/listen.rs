@@ -1,13 +1,17 @@
-use futures::{Stream, StreamExt, stream::SelectAll};
+use futures::{
+    Stream, StreamExt,
+    stream::{BoxStream, SelectAll},
+};
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::{
+    collections::HashMap,
     io::ErrorKind,
     pin::Pin,
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf};
 use tokio_stream::wrappers::LinesStream;
 
 #[cfg(unix)]
@@ -22,6 +26,45 @@ use tokio::net::TcpStream;
 
 use crate::{FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError};
 
+type ConnectionId = u64;
+type ConnectionLineStream = BoxStream<'static, ConnectionInput>;
+
+#[cfg(unix)]
+type ConnectionWriter = WriteHalf<UnixStream>;
+#[cfg(windows)]
+type ConnectionWriter = WriteHalf<TcpStream>;
+
+enum ConnectionInput {
+    Line(ConnectionId, Result<String, std::io::Error>),
+    Closed(ConnectionId),
+}
+
+#[derive(Default)]
+struct ConnectionCapabilities {
+    control_events: bool,
+}
+
+impl ConnectionCapabilities {
+    fn observe(&mut self, request: &FrontendRequest) {
+        if matches!(request, FrontendRequest::GetControlMode) {
+            self.control_events = true;
+        }
+    }
+
+    fn accepts(&self, event: &FrontendEvent) -> bool {
+        self.control_events
+            || !matches!(
+                event,
+                FrontendEvent::ControlMode(_) | FrontendEvent::ControlState(_)
+            )
+    }
+}
+
+struct FrontendConnection {
+    tx: ConnectionWriter,
+    capabilities: ConnectionCapabilities,
+}
+
 pub struct AsyncFrontendListener {
     #[cfg(windows)]
     listener: TcpListener,
@@ -29,14 +72,9 @@ pub struct AsyncFrontendListener {
     listener: UnixListener,
     #[cfg(unix)]
     socket_path: PathBuf,
-    #[cfg(unix)]
-    line_streams: SelectAll<LinesStream<BufReader<ReadHalf<UnixStream>>>>,
-    #[cfg(windows)]
-    line_streams: SelectAll<LinesStream<BufReader<ReadHalf<TcpStream>>>>,
-    #[cfg(unix)]
-    tx_streams: Vec<WriteHalf<UnixStream>>,
-    #[cfg(windows)]
-    tx_streams: Vec<WriteHalf<TcpStream>>,
+    line_streams: SelectAll<ConnectionLineStream>,
+    connections: HashMap<ConnectionId, FrontendConnection>,
+    next_connection_id: ConnectionId,
 }
 
 impl AsyncFrontendListener {
@@ -96,7 +134,8 @@ impl AsyncFrontendListener {
             #[cfg(unix)]
             socket_path,
             line_streams: SelectAll::new(),
-            tx_streams: vec![],
+            connections: HashMap::new(),
+            next_connection_id: 0,
         };
 
         Ok(adapter)
@@ -107,20 +146,20 @@ impl AsyncFrontendListener {
         let mut json = serde_json::to_string(&notify).unwrap();
         json.push('\n');
 
-        let mut keep = vec![];
+        let mut disconnected = Vec::new();
         // TODO do simultaneously
-        for tx in self.tx_streams.iter_mut() {
-            // write len + payload
-            if tx.write(json.as_bytes()).await.is_err() {
-                keep.push(false);
+        for (connection_id, connection) in &mut self.connections {
+            if !connection.capabilities.accepts(&notify) {
                 continue;
             }
-            keep.push(true);
+            if connection.tx.write_all(json.as_bytes()).await.is_err() {
+                disconnected.push(*connection_id);
+            }
         }
 
-        // could not find a better solution because async
-        let mut keep = keep.into_iter();
-        self.tx_streams.retain(|_| keep.next().unwrap());
+        for connection_id in disconnected {
+            self.connections.remove(&connection_id);
+        }
     }
 }
 
@@ -144,18 +183,47 @@ impl Drop for AsyncFrontendListener {
 impl Stream for AsyncFrontendListener {
     type Item = Result<FrontendRequest, IpcError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Poll::Ready(Some(Ok(l))) = self.line_streams.poll_next_unpin(cx) {
-            let request = serde_json::from_str(l.as_str()).map_err(|e| e.into());
-            return Poll::Ready(Some(request));
+        loop {
+            match self.line_streams.poll_next_unpin(cx) {
+                Poll::Ready(Some(ConnectionInput::Line(connection_id, line))) => {
+                    let request = line
+                        .map_err(IpcError::from)
+                        .and_then(|line| serde_json::from_str(&line).map_err(IpcError::from));
+                    if let Ok(request) = &request {
+                        if let Some(connection) = self.connections.get_mut(&connection_id) {
+                            connection.capabilities.observe(request);
+                        }
+                    }
+                    return Poll::Ready(Some(request));
+                }
+                Poll::Ready(Some(ConnectionInput::Closed(connection_id))) => {
+                    self.connections.remove(&connection_id);
+                }
+                Poll::Ready(None) | Poll::Pending => break,
+            }
         }
+
         let mut sync = false;
         while let Poll::Ready(Ok((stream, _))) = self.listener.poll_accept(cx) {
+            let connection_id = self.next_connection_id;
+            self.next_connection_id = self.next_connection_id.wrapping_add(1);
             let (rx, tx) = tokio::io::split(stream);
             let buf_reader = BufReader::new(rx);
             let lines = buf_reader.lines();
-            let lines = LinesStream::new(lines);
+            let lines = LinesStream::new(lines)
+                .map(move |line| ConnectionInput::Line(connection_id, line))
+                .chain(futures::stream::once(async move {
+                    ConnectionInput::Closed(connection_id)
+                }))
+                .boxed();
             self.line_streams.push(lines);
-            self.tx_streams.push(tx);
+            self.connections.insert(
+                connection_id,
+                FrontendConnection {
+                    tx,
+                    capabilities: ConnectionCapabilities::default(),
+                },
+            );
             sync = true;
         }
         if sync {
@@ -163,5 +231,42 @@ impl Stream for AsyncFrontendListener {
         } else {
             Poll::Pending
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ControlMode, ControlState, Status};
+
+    #[test]
+    fn control_events_require_an_explicit_capability_request() {
+        let mut capabilities = ConnectionCapabilities::default();
+
+        assert!(capabilities.accepts(&FrontendEvent::CaptureStatus(Status::Enabled)));
+        assert!(!capabilities.accepts(&FrontendEvent::ControlMode(ControlMode::Bidirectional)));
+        assert!(!capabilities.accepts(&FrontendEvent::ControlState(ControlState::Idle)));
+
+        capabilities.observe(&FrontendRequest::Sync);
+        assert!(!capabilities.accepts(&FrontendEvent::ControlState(ControlState::Idle)));
+
+        capabilities.observe(&FrontendRequest::GetControlMode);
+        assert!(capabilities.accepts(&FrontendEvent::ControlMode(ControlMode::Bidirectional)));
+        assert!(capabilities.accepts(&FrontendEvent::ControlState(ControlState::Idle)));
+    }
+
+    #[test]
+    fn capability_state_is_independent_for_each_connection() {
+        let mut old_frontend = ConnectionCapabilities::default();
+        let mut new_frontend = ConnectionCapabilities::default();
+
+        new_frontend.observe(&FrontendRequest::GetControlMode);
+
+        let event = FrontendEvent::ControlState(ControlState::ReadyToReceive);
+        assert!(!old_frontend.accepts(&event));
+        assert!(new_frontend.accepts(&event));
+
+        old_frontend.observe(&FrontendRequest::Enumerate());
+        assert!(!old_frontend.accepts(&event));
     }
 }

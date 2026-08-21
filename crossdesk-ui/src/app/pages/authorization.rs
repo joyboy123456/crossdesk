@@ -10,7 +10,7 @@ use crate::theme;
 impl CrossDeskApp {
     pub(crate) fn authorization_page(&mut self, ui: &mut egui::Ui) {
         let palette = theme::palette(ui);
-        theme::card_frame(ui).show(ui, |ui| {
+        theme::row_frame(ui).show(ui, |ui| {
             ui.label(RichText::new("本机证书指纹").strong());
             ui.horizontal(|ui| {
                 ui.monospace(if self.state.fingerprint.is_empty() {
@@ -27,9 +27,9 @@ impl CrossDeskApp {
             });
         });
 
-        ui.add_space(14.0);
+        ui.add_space(6.0);
         theme::section_label(ui, "待授权");
-        ui.add_space(4.0);
+        ui.add_space(2.0);
         for fingerprint in self.state.pending_authorizations.clone() {
             let mut cancel = false;
             theme::row_frame(ui).show(ui, |ui| {
@@ -53,8 +53,8 @@ impl CrossDeskApp {
             }
         }
 
-        ui.add_space(12.0);
-        theme::card_frame(ui).show(ui, |ui| {
+        ui.add_space(6.0);
+        theme::row_frame(ui).show(ui, |ui| {
             let description_label = ui.label("设备名称");
             ui.text_edit_singleline(&mut self.auth_description)
                 .labelled_by(description_label.id);
@@ -80,9 +80,9 @@ impl CrossDeskApp {
             }
         });
 
-        ui.add_space(14.0);
+        ui.add_space(6.0);
         theme::section_label(ui, "已授权设备");
-        ui.add_space(4.0);
+        ui.add_space(2.0);
         let mut authorized = self
             .state
             .authorized

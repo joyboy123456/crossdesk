@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
 };
 
-use input_event::{Event, KeyboardEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
 
@@ -110,6 +110,7 @@ pub struct InputEmulation {
     backend: Backend,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
+    pressed_buttons: HashMap<EmulationHandle, HashSet<u32>>,
 }
 
 impl InputEmulation {
@@ -134,6 +135,7 @@ impl InputEmulation {
             backend,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
         })
     }
 
@@ -193,11 +195,31 @@ impl InputEmulation {
     ) -> Result<(), EmulationError> {
         match event {
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
+                if !tracks_pressed_key(key) {
+                    return self.emulation.consume(event, handle).await;
+                }
                 // prevent double pressed / released keys
                 if self.update_pressed_keys(handle, key, state) {
                     self.emulation.consume(event, handle).await?;
                 }
                 Ok(())
+            }
+            Event::Pointer(PointerEvent::Button { button, state, .. }) => {
+                if self.update_pressed_buttons(handle, button, state) {
+                    self.emulation.consume(event, handle).await?;
+                }
+                Ok(())
+            }
+            Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed,
+                latched,
+                locked,
+                ..
+            }) => {
+                if let Some(keys) = self.pressed_keys.get_mut(&handle) {
+                    reconcile_pressed_modifiers(keys, depressed | latched | locked);
+                }
+                self.emulation.consume(event, handle).await
             }
             _ => self.emulation.consume(event, handle).await,
         }
@@ -212,6 +234,7 @@ impl InputEmulation {
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
+            self.pressed_buttons.insert(handle, HashSet::new());
             self.emulation.create(handle).await;
             true
         } else {
@@ -220,9 +243,11 @@ impl InputEmulation {
     }
 
     pub async fn destroy(&mut self, handle: EmulationHandle) {
+        let _ = self.release_buttons(handle).await;
         let _ = self.release_keys(handle).await;
         if self.handles.remove(&handle) {
             self.pressed_keys.remove(&handle);
+            self.pressed_buttons.remove(&handle);
             self.emulation.destroy(handle).await
         }
     }
@@ -260,6 +285,22 @@ impl InputEmulation {
         Ok(())
     }
 
+    pub async fn release_buttons(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
+        if let Some(buttons) = self.pressed_buttons.get_mut(&handle) {
+            let buttons = buttons.drain().collect::<Vec<_>>();
+            for button in buttons {
+                let event = Event::Pointer(PointerEvent::Button {
+                    time: 0,
+                    button,
+                    state: 0,
+                });
+                self.emulation.consume(event, handle).await?;
+                log::warn!("releasing stuck mouse button: {button}");
+            }
+        }
+        Ok(())
+    }
+
     pub fn has_pressed_keys(&self, handle: EmulationHandle) -> bool {
         self.pressed_keys
             .get(&handle)
@@ -281,6 +322,47 @@ impl InputEmulation {
             pressed_keys.insert(key)
         }
     }
+
+    fn update_pressed_buttons(&mut self, handle: EmulationHandle, button: u32, state: u32) -> bool {
+        let Some(pressed_buttons) = self.pressed_buttons.get_mut(&handle) else {
+            return false;
+        };
+
+        if state == 0 {
+            pressed_buttons.remove(&button)
+        } else {
+            pressed_buttons.insert(button)
+        }
+    }
+}
+
+fn tracks_pressed_key(key: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    if scancode::Linux::try_from(key) == Ok(scancode::Linux::KeyCapsLock) {
+        // macOS models Caps Lock as a locking edge, not a held key. Keeping it
+        // in the generic pressed-key set makes a lost pulse release suppress
+        // every later toggle until the control session is destroyed.
+        return false;
+    }
+    true
+}
+
+fn reconcile_pressed_modifiers(pressed_keys: &mut HashSet<u32>, active: u32) {
+    pressed_keys.retain(|key| {
+        let Ok(key) = scancode::Linux::try_from(*key) else {
+            return true;
+        };
+        let mask = match key {
+            scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => 1 << 0,
+            scancode::Linux::KeyCapsLock => 1 << 1,
+            scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => 1 << 2,
+            scancode::Linux::KeyLeftAlt => 1 << 3,
+            scancode::Linux::KeyRightalt => (1 << 3) | (1 << 7),
+            scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => 1 << 6,
+            _ => return true,
+        };
+        active & mask != 0
+    });
 }
 
 #[async_trait]
@@ -301,7 +383,34 @@ trait Emulation: Send {
 
 #[cfg(test)]
 mod tests {
-    use super::Backend;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    struct RecordingEmulation {
+        buttons: Arc<Mutex<Vec<(u32, u32)>>>,
+    }
+
+    #[async_trait]
+    impl Emulation for RecordingEmulation {
+        async fn consume(
+            &mut self,
+            event: Event,
+            _handle: EmulationHandle,
+        ) -> Result<(), EmulationError> {
+            if let Event::Pointer(PointerEvent::Button { button, state, .. }) = event {
+                self.buttons
+                    .lock()
+                    .expect("button event recorder")
+                    .push((button, state));
+            }
+            Ok(())
+        }
+
+        async fn create(&mut self, _handle: EmulationHandle) {}
+        async fn destroy(&mut self, _handle: EmulationHandle) {}
+        async fn terminate(&mut self) {}
+    }
 
     /// The service decides whether to let a peer take control from this, so a
     /// backend that silently drops events must never claim it can emulate.
@@ -312,5 +421,56 @@ mod tests {
         assert!(Backend::Windows.can_emulate());
         #[cfg(target_os = "macos")]
         assert!(Backend::MacOs.can_emulate());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn caps_lock_is_not_retained_as_a_pressed_key() {
+        assert!(!tracks_pressed_key(scancode::Linux::KeyCapsLock as u32));
+        assert!(tracks_pressed_key(scancode::Linux::KeyA as u32));
+    }
+
+    #[test]
+    fn modifier_snapshot_clears_stale_pressed_modifier_keys_only() {
+        let mut pressed = HashSet::from([
+            scancode::Linux::KeyLeftShift as u32,
+            scancode::Linux::KeyLeftCtrl as u32,
+            scancode::Linux::KeyA as u32,
+        ]);
+        reconcile_pressed_modifiers(&mut pressed, 0);
+        assert_eq!(pressed, HashSet::from([scancode::Linux::KeyA as u32]));
+    }
+
+    #[tokio::test]
+    async fn destroying_a_handle_releases_its_pressed_mouse_buttons() {
+        let buttons = Arc::new(Mutex::new(Vec::new()));
+        let mut emulation = InputEmulation {
+            emulation: Box::new(RecordingEmulation {
+                buttons: buttons.clone(),
+            }),
+            backend: Backend::Dummy,
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+        };
+
+        emulation.create(9).await;
+        emulation
+            .consume(
+                Event::Pointer(PointerEvent::Button {
+                    time: 0,
+                    button: 0x110,
+                    state: 1,
+                }),
+                9,
+            )
+            .await
+            .expect("button down");
+        emulation.destroy(9).await;
+
+        assert_eq!(
+            *buttons.lock().expect("button event recorder"),
+            vec![(0x110, 1), (0x110, 0)]
+        );
     }
 }

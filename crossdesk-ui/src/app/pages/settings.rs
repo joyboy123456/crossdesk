@@ -1,7 +1,7 @@
 //! Service status, clipboard synchronization and platform permissions.
 
 use eframe::egui::{self, Align, Layout, RichText};
-use lan_mouse_ipc::{FrontendRequest, Status};
+use lan_mouse_ipc::{ControlMode, FrontendRequest, Status};
 
 use crate::app::CrossDeskApp;
 use crate::app::widgets::settings_row;
@@ -14,7 +14,7 @@ impl CrossDeskApp {
     pub(crate) fn settings_page(&mut self, ui: &mut egui::Ui) {
         let palette = theme::palette(ui);
         settings_row(ui, "本机名称", &self.local_hostname, None);
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         theme::card_frame(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
                 let port_label = ui.label(RichText::new("监听端口").strong());
@@ -40,16 +40,16 @@ impl CrossDeskApp {
             });
         });
 
-        ui.add_space(18.0);
+        ui.add_space(10.0);
         theme::section_label(ui, "输入服务");
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         self.status_row(
             ui,
             "输入捕获",
             self.state.capture_status,
             FrontendRequest::EnableCapture,
         );
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         self.status_row(
             ui,
             "输入注入",
@@ -57,9 +57,9 @@ impl CrossDeskApp {
             FrontendRequest::EnableEmulation,
         );
 
-        ui.add_space(18.0);
+        ui.add_space(10.0);
         theme::section_label(ui, "剪贴板");
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         theme::card_frame(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
                 let mut enabled = self.state.clipboard_enabled;
@@ -86,12 +86,14 @@ impl CrossDeskApp {
             });
         });
 
+        self.control_mode_section(ui);
+
         #[cfg(target_os = "macos")]
         self.macos_permissions_section(ui);
 
-        ui.add_space(18.0);
+        ui.add_space(10.0);
         theme::section_label(ui, "运行状态");
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         settings_row(
             ui,
             "后台服务",
@@ -106,6 +108,48 @@ impl CrossDeskApp {
                 palette.warning
             }),
         );
+    }
+
+    fn control_mode_section(&mut self, ui: &mut egui::Ui) {
+        let palette = theme::palette(ui);
+        ui.add_space(10.0);
+        theme::section_label(ui, "控制方式");
+        ui.add_space(4.0);
+        let mut selected_mode = self.state.control_mode;
+        theme::card_frame(ui).show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.radio_value(&mut selected_mode, ControlMode::SendOnly, "仅控制其他设备");
+                ui.label(
+                    RichText::new("使用本机键鼠控制其他设备，不接受远端控制")
+                        .size(theme::CAPTION_SIZE)
+                        .color(palette.text_muted),
+                );
+
+                ui.add_space(4.0);
+                ui.radio_value(&mut selected_mode, ControlMode::ReceiveOnly, "仅允许被控制");
+                ui.label(
+                    RichText::new("只允许已授权设备控制本机，不捕获本机屏幕边缘")
+                        .size(theme::CAPTION_SIZE)
+                        .color(palette.text_muted),
+                );
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut selected_mode, ControlMode::Bidirectional, "双向自动");
+                    theme::status_badge(ui, palette.warning, "高级");
+                });
+                ui.label(
+                    RichText::new("两端均可发起控制；同一时刻只会有一个控制角色")
+                        .size(theme::CAPTION_SIZE)
+                        .color(palette.text_muted),
+                );
+            });
+        });
+        if selected_mode != self.state.control_mode
+            && self.send(FrontendRequest::SetControlMode(selected_mode))
+        {
+            self.state.control_mode = selected_mode;
+        }
     }
 
     fn status_row(
@@ -143,9 +187,9 @@ impl CrossDeskApp {
     #[cfg(target_os = "macos")]
     pub(crate) fn macos_permissions_section(&mut self, ui: &mut egui::Ui) {
         let palette = theme::palette(ui);
-        ui.add_space(18.0);
+        ui.add_space(10.0);
         theme::section_label(ui, "macOS 权限");
-        ui.add_space(6.0);
+        ui.add_space(4.0);
 
         let accessibility = self.macos_permissions.accessibility;
         theme::card_frame(ui).show(ui, |ui| {
@@ -174,7 +218,7 @@ impl CrossDeskApp {
             });
         });
 
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         let input_monitoring = self.macos_permissions.input_monitoring;
         theme::card_frame(ui).show(ui, |ui| {
             ui.horizontal(|ui| {

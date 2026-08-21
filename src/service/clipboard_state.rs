@@ -55,6 +55,9 @@ impl ClipboardState {
         if !self.enabled {
             return ClipboardAction::Ignore;
         }
+        if self.text.as_deref() == Some(text.as_str()) {
+            return ClipboardAction::Ignore;
+        }
         if text.len() > MAX_CLIPBOARD_TEXT_SIZE {
             log::warn!(
                 "clipboard text was not synchronized: {} bytes exceeds the {} byte limit",
@@ -66,14 +69,6 @@ impl ClipboardState {
             return self.cache(None, false);
         }
         self.cache(Some(text), true)
-    }
-
-    /// A peer sent us clipboard text.
-    ///
-    /// `false` means it must not be applied - either synchronization is off, or
-    /// this is our own text coming back.
-    pub(crate) fn accepts_remote_text(&self, text: &str) -> bool {
-        self.enabled && self.text.as_deref() != Some(text)
     }
 
     /// Remote text was applied to the local clipboard successfully.
@@ -121,7 +116,6 @@ mod tests {
     fn nothing_happens_while_synchronization_is_off() {
         let mut state = ClipboardState::new(false);
         assert_eq!(state.on_local_text("hello".into()), ClipboardAction::Ignore);
-        assert!(!state.accepts_remote_text("hello"));
     }
 
     #[test]
@@ -147,7 +141,6 @@ mod tests {
     fn applied_remote_text_is_not_echoed_back() {
         let mut state = ClipboardState::new(true);
 
-        assert!(state.accepts_remote_text("from peer"));
         assert_eq!(
             state.on_remote_text_applied("from peer".into()),
             ClipboardAction::Cache {
@@ -155,27 +148,10 @@ mod tests {
                 broadcast: false
             }
         );
-
-        assert!(
-            !state.accepts_remote_text("from peer"),
-            "the same text arriving again must be ignored"
-        );
         assert_eq!(
             state.on_local_text("from peer".into()),
-            ClipboardAction::Cache {
-                text: Some("from peer".into()),
-                broadcast: true
-            },
-            "the poller reporting it is cached again; peers already have it"
+            ClipboardAction::Ignore
         );
-    }
-
-    #[test]
-    fn different_remote_text_is_still_accepted() {
-        let mut state = ClipboardState::new(true);
-        state.on_remote_text_applied("first".into());
-
-        assert!(state.accepts_remote_text("second"));
     }
 
     #[test]
@@ -191,11 +167,7 @@ mod tests {
             }
         );
         assert_eq!(state.set_enabled(true), ClipboardAction::Ignore);
-        assert!(
-            state.accepts_remote_text("hello"),
-            "the same text must be accepted again after a round trip through \
-             disabled"
-        );
+        assert_eq!(state.on_local_text("hello".into()), cached("hello"));
     }
 
     #[test]

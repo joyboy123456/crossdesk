@@ -92,6 +92,19 @@ pub enum IpcError {
 
 pub const DEFAULT_PORT: u16 = 4242;
 
+/// Determines which side of a CrossDesk connection this device may operate.
+///
+/// `Bidirectional` preserves the behavior of clients that predate explicit
+/// role selection.
+#[derive(Debug, Default, Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlMode {
+    #[default]
+    Bidirectional,
+    SendOnly,
+    ReceiveOnly,
+}
+
 #[derive(Debug, Default, Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Position {
@@ -190,6 +203,23 @@ impl Default for ClientConfig {
 
 pub type ClientHandle = u64;
 
+/// The device's current role in the mutually exclusive control session.
+#[derive(Debug, Default, Eq, PartialEq, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlState {
+    #[default]
+    Idle,
+    ReadyToReceive,
+    Controlling {
+        handle: ClientHandle,
+    },
+    ControlledBy {
+        addr: SocketAddr,
+        fingerprint: String,
+    },
+    Switching,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClientState {
     /// events should be sent to and received from the client
@@ -244,6 +274,10 @@ pub enum FrontendEvent {
     PublicKeyFingerprint(String),
     /// text clipboard synchronization state and platform availability
     ClipboardState { enabled: bool, available: bool },
+    /// configured device role
+    ControlMode(ControlMode),
+    /// current mutually exclusive control-session role
+    ControlState(ControlState),
     /// new device connected
     DeviceConnected {
         addr: SocketAddr,
@@ -291,6 +325,12 @@ pub enum FrontendRequest {
     EnableEmulation,
     /// enable or disable UTF-8 text clipboard synchronization
     SetClipboardSync(bool),
+    /// request the configured device role
+    GetControlMode,
+    /// change the configured device role
+    SetControlMode(ControlMode),
+    /// stop the current incoming or outgoing control session
+    DisconnectControl,
     /// synchronize all state
     Sync,
     /// authorize fingerprint (description, fingerprint)
@@ -315,7 +355,8 @@ pub enum Status {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientConfig, ClientState, DEFAULT_PORT, FrontendEvent, FrontendRequest, Position, Status,
+        ClientConfig, ClientState, ControlMode, ControlState, DEFAULT_PORT, FrontendEvent,
+        FrontendRequest, Position, Status,
     };
 
     /// Frontends and the service are built and shipped separately (the CLI
@@ -349,6 +390,12 @@ mod tests {
                 FrontendRequest::SetClipboardSync(true),
                 r#"{"SetClipboardSync":true}"#,
             ),
+            (FrontendRequest::GetControlMode, r#""GetControlMode""#),
+            (
+                FrontendRequest::SetControlMode(ControlMode::ReceiveOnly),
+                r#"{"SetControlMode":"receive_only"}"#,
+            ),
+            (FrontendRequest::DisconnectControl, r#""DisconnectControl""#),
             (FrontendRequest::Sync, r#""Sync""#),
             (
                 FrontendRequest::AuthorizeKey("desc".into(), "aa:bb".into()),
@@ -395,6 +442,14 @@ mod tests {
                 r#"{"ClipboardState":{"enabled":true,"available":false}}"#,
             ),
             (
+                FrontendEvent::ControlMode(ControlMode::SendOnly),
+                r#"{"ControlMode":"send_only"}"#,
+            ),
+            (
+                FrontendEvent::ControlState(ControlState::Controlling { handle: 7 }),
+                r#"{"ControlState":{"controlling":{"handle":7}}}"#,
+            ),
+            (
                 FrontendEvent::ConnectionAttempt {
                     fingerprint: "aa:bb".into(),
                 },
@@ -437,7 +492,49 @@ mod tests {
         assert_eq!(DEFAULT_PORT, 4242);
         assert_eq!(ClientConfig::default().port, DEFAULT_PORT);
         assert_eq!(ClientConfig::default().pos, Position::Left);
+        assert_eq!(ControlMode::default(), ControlMode::Bidirectional);
+        assert_eq!(ControlState::default(), ControlState::Idle);
         assert_eq!(Status::default(), Status::Disabled);
+    }
+
+    #[test]
+    fn control_mode_json_representation_is_frozen() {
+        for (mode, expected) in [
+            (ControlMode::Bidirectional, r#""bidirectional""#),
+            (ControlMode::SendOnly, r#""send_only""#),
+            (ControlMode::ReceiveOnly, r#""receive_only""#),
+        ] {
+            let json = serde_json::to_string(&mode).expect("serialize control mode");
+            assert_eq!(json, expected);
+            let decoded = serde_json::from_str(&json).expect("deserialize control mode");
+            assert_eq!(mode, decoded);
+        }
+    }
+
+    #[test]
+    fn control_state_json_representation_is_frozen() {
+        let addr = "192.168.1.42:4242".parse().expect("valid test address");
+        for (state, expected) in [
+            (ControlState::Idle, r#""idle""#),
+            (ControlState::ReadyToReceive, r#""ready_to_receive""#),
+            (
+                ControlState::Controlling { handle: 7 },
+                r#"{"controlling":{"handle":7}}"#,
+            ),
+            (
+                ControlState::ControlledBy {
+                    addr,
+                    fingerprint: "aa:bb".into(),
+                },
+                r#"{"controlled_by":{"addr":"192.168.1.42:4242","fingerprint":"aa:bb"}}"#,
+            ),
+            (ControlState::Switching, r#""switching""#),
+        ] {
+            let json = serde_json::to_string(&state).expect("serialize control state");
+            assert_eq!(json, expected);
+            let decoded = serde_json::from_str(&json).expect("deserialize control state");
+            assert_eq!(state, decoded);
+        }
     }
 
     #[cfg(windows)]

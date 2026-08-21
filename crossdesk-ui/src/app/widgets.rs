@@ -21,17 +21,21 @@ pub(crate) fn nav_item(
     let selected = current == page;
     let t = ui
         .ctx()
-        .animate_bool_with_time(Id::new(("nav", label)), selected, 0.15);
+        .animate_bool_with_time(Id::new(("nav", label)), selected, 0.18);
     let (rect, mut response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
     response = response.on_hover_cursor(CursorIcon::PointingHand);
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
 
-    if response.hovered() && !selected {
+    let hover_t =
+        ui.ctx()
+            .animate_bool_with_time(Id::new(("nav-hover", label)), response.hovered(), 0.12);
+
+    if hover_t > 0.01 && !selected {
         ui.painter().rect_filled(
             rect,
             CornerRadius::same(theme::WIDGET_RADIUS),
-            palette.surface_raised,
+            palette.surface.gamma_multiply(hover_t),
         );
     }
     if t > 0.01 {
@@ -40,27 +44,39 @@ pub(crate) fn nav_item(
             CornerRadius::same(theme::WIDGET_RADIUS),
             palette.accent_soft.gamma_multiply(t),
         );
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(theme::WIDGET_RADIUS),
+            Stroke::new(1.0, palette.accent.gamma_multiply(0.35 * t)),
+            StrokeKind::Inside,
+        );
+        // Gradient selection bar on the leading edge.
+        let bar = Rect::from_min_size(rect.min + Vec2::new(5.0, 9.0), Vec2::new(3.0, 22.0));
+        let top = Rect::from_min_size(bar.min, Vec2::new(bar.width(), bar.height() / 2.0));
+        let bottom = Rect::from_min_max(Pos2::new(bar.left(), bar.center().y), bar.max);
+        ui.painter()
+            .rect_filled(top, CornerRadius::same(2), palette.accent.gamma_multiply(t));
         ui.painter().rect_filled(
-            Rect::from_min_size(rect.min + Vec2::new(4.0, 9.0), Vec2::new(3.0, 20.0)),
+            bottom,
             CornerRadius::same(2),
-            palette.accent.gamma_multiply(t),
+            palette.accent_hot.gamma_multiply(t),
         );
     }
 
     let emphasized = t > 0.5 || response.hovered();
     let (glyph, family) = icon_glyph(icon_name);
     ui.painter().text(
-        Pos2::new(rect.left() + 21.0, rect.center().y),
+        Pos2::new(rect.left() + 24.0, rect.center().y),
         Align2::CENTER_CENTER,
         glyph.to_string(),
-        theme::icon_font(&family, 16.0),
-        theme::lerp_color(palette.text_secondary, palette.accent, t),
+        theme::icon_font(&family, 16.5),
+        theme::lerp_color(palette.text_muted, palette.accent, t.max(hover_t * 0.6)),
     );
     ui.painter().text(
-        Pos2::new(rect.left() + 40.0, rect.center().y),
+        Pos2::new(rect.left() + 44.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(theme::BODY_SIZE),
+        FontId::proportional(theme::BODY_SIZE + 0.5),
         if emphasized {
             palette.text
         } else {
@@ -98,19 +114,19 @@ pub(crate) fn paint_screen(
     painter.rect(
         rect,
         CornerRadius::same(theme::CARD_RADIUS),
-        if screen.local {
-            palette.accent
-        } else {
-            palette.surface_raised
-        },
+        palette.surface_raised,
         Stroke::new(
             if screen.selected || screen.dragging {
                 2.0
+            } else if screen.local {
+                1.5
             } else {
                 1.0
             },
             if screen.dragging || screen.selected {
                 palette.accent
+            } else if screen.local {
+                palette.accent.gamma_multiply(0.55)
             } else if screen.pending {
                 palette.warning
             } else {
@@ -119,20 +135,22 @@ pub(crate) fn paint_screen(
         ),
         StrokeKind::Inside,
     );
-    // Inner hairline for a double-border look.
-    painter.rect_stroke(
-        rect.shrink(3.0),
-        CornerRadius::same(theme::CARD_RADIUS - 3),
-        Stroke::new(
-            1.0,
-            if screen.local {
-                Color32::WHITE.gamma_multiply(0.35)
-            } else {
-                palette.border.gamma_multiply(0.6)
-            },
-        ),
-        StrokeKind::Inside,
-    );
+
+    // Top gradient accent strip on the local machine card.
+    if screen.local {
+        let strip = Rect::from_min_size(
+            rect.min + Vec2::new(2.0, 2.0),
+            Vec2::new(rect.width() - 4.0, 2.5),
+        );
+        theme::accent_gradient_line(painter, strip, palette);
+    } else {
+        painter.rect_stroke(
+            rect.shrink(3.0),
+            CornerRadius::same(theme::CARD_RADIUS - 3),
+            Stroke::new(1.0, palette.border.gamma_multiply(0.5)),
+            StrokeKind::Inside,
+        );
+    }
 
     if !screen.local {
         let handle_rect = screen_handle_rect(rect);
@@ -171,22 +189,14 @@ pub(crate) fn paint_screen(
         Align2::CENTER_CENTER,
         screen.number,
         FontId::proportional(18.0),
-        if screen.local {
-            Color32::WHITE
-        } else {
-            palette.text
-        },
+        palette.text,
     );
     painter.text(
         Pos2::new(content_rect.center().x, rect.center().y + 14.0),
         Align2::CENTER_CENTER,
         screen.name,
         FontId::proportional(13.0),
-        if screen.local {
-            Color32::from_rgb(219, 234, 254)
-        } else {
-            palette.text_muted
-        },
+        palette.text_muted,
     );
 
     let dot_center = screen_status_rect(rect).center();
@@ -196,8 +206,8 @@ pub(crate) fn paint_screen(
         let pulse = 0.5 + 0.5 * (time * 4.0).sin();
         painter.circle_filled(
             dot_center,
-            6.5,
-            palette.warning.gamma_multiply(0.2 + 0.3 * pulse),
+            7.0,
+            palette.warning.gamma_multiply(0.15 + 0.25 * pulse),
         );
         painter.circle_filled(
             dot_center,
@@ -207,7 +217,16 @@ pub(crate) fn paint_screen(
     } else {
         painter.circle_filled(
             dot_center,
-            3.5,
+            5.0,
+            if screen.online {
+                palette.success.gamma_multiply(0.2)
+            } else {
+                palette.warning.gamma_multiply(0.2)
+            },
+        );
+        painter.circle_filled(
+            dot_center,
+            3.0,
             if screen.online {
                 palette.success
             } else {
@@ -223,12 +242,9 @@ pub(crate) fn settings_row(ui: &mut egui::Ui, label: &str, value: &str, color: O
             ui.label(RichText::new(label).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(color) = color {
-                    ui.horizontal(|ui| {
-                        theme::status_dot(ui, color);
-                        ui.colored_label(color, value);
-                    });
+                    theme::status_badge(ui, color, value);
                 } else {
-                    ui.label(value);
+                    ui.label(RichText::new(value).color(theme::palette(ui).text_secondary));
                 }
             });
         });
@@ -241,8 +257,26 @@ pub(crate) fn icon_button(
     tooltip: &str,
     color: Color32,
 ) -> egui::Response {
-    ui.add(Button::new(icon(name, 16.0, color)).frame(false))
-        .on_hover_text(tooltip)
+    let response = ui.add(Button::new(icon(name, 16.0, color)).frame(false));
+    let hover_t =
+        ui.ctx()
+            .animate_bool_with_time(Id::new(("icon-btn-hover", name)), response.hovered(), 0.1);
+    if hover_t > 0.01 {
+        ui.painter().circle_filled(
+            response.rect.center(),
+            response.rect.height() * 0.62,
+            theme::palette(ui).surface_raised.gamma_multiply(hover_t),
+        );
+        let (glyph, family) = icon_glyph(name);
+        ui.painter().text(
+            response.rect.center(),
+            Align2::CENTER_CENTER,
+            glyph.to_string(),
+            theme::icon_font(&family, 16.0),
+            color,
+        );
+    }
+    response.on_hover_text(tooltip)
 }
 
 pub(crate) fn icon_glyph(name: &str) -> (char, String) {

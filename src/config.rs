@@ -16,7 +16,7 @@ use thiserror::Error;
 use toml_edit::{self, DocumentMut};
 
 use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{ControlMode, DEFAULT_PORT, Position};
 
 use input_event::scancode::{
     self,
@@ -66,6 +66,7 @@ struct ConfigToml {
     port: Option<u16>,
     release_bind: Option<Vec<scancode::Linux>>,
     clipboard_sync: Option<bool>,
+    control_mode: Option<ControlMode>,
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
@@ -511,6 +512,14 @@ impl Config {
             .unwrap_or(true)
     }
 
+    /// whether this device may send input, receive input, or both
+    pub fn control_mode(&self) -> ControlMode {
+        self.config_toml
+            .as_ref()
+            .and_then(|config| config.control_mode)
+            .unwrap_or_default()
+    }
+
     /// the parsed config file, creating an empty one if none was loaded
     fn config_toml_mut(&mut self) -> &mut ConfigToml {
         self.config_toml.get_or_insert_with(Default::default)
@@ -528,6 +537,11 @@ impl Config {
     /// enable or disable text clipboard synchronization
     pub fn set_clipboard_sync(&mut self, enabled: bool) {
         self.config_toml_mut().clipboard_sync = Some(enabled);
+    }
+
+    /// set whether this device may send input, receive input, or both
+    pub fn set_control_mode(&mut self, mode: ControlMode) {
+        self.config_toml_mut().control_mode = Some(mode);
     }
 
     /// set authorized keys
@@ -610,8 +624,8 @@ mod tests {
 release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 port = 4242
 clipboard_sync = false
-capture_backend = "windows"
-emulation_backend = "windows"
+capture_backend = "dummy"
+emulation_backend = "dummy"
 cert_path = "/tmp/cert.pem"
 
 [authorized_fingerprints]
@@ -636,8 +650,8 @@ port = 4243
 
         assert_eq!(config.port, Some(4242));
         assert_eq!(config.clipboard_sync, Some(false));
-        assert_eq!(config.capture_backend, Some(CaptureBackend::Windows));
-        assert_eq!(config.emulation_backend, Some(EmulationBackend::Windows));
+        assert_eq!(config.capture_backend, Some(CaptureBackend::Dummy));
+        assert_eq!(config.emulation_backend, Some(EmulationBackend::Dummy));
         assert_eq!(config.cert_path, Some(PathBuf::from("/tmp/cert.pem")));
         assert_eq!(
             config.release_bind,
@@ -680,10 +694,12 @@ port = 4243
         assert_eq!(config.port, None, "no port key means Config::port decides");
         assert_eq!(config.clients, None);
         assert_eq!(config.clipboard_sync, None);
+        assert_eq!(config.control_mode, None);
         assert_eq!(config.release_bind, None);
 
         // the fallbacks Config applies for the absent keys
         assert_eq!(DEFAULT_PORT, 4242);
+        assert_eq!(ControlMode::default(), ControlMode::Bidirectional);
         assert!(
             DEFAULT_RELEASE_KEYS.contains(&scancode::Linux::KeyLeftAlt),
             "the default release bind is the four left modifiers"
@@ -738,6 +754,71 @@ port = 4243
             toml_client.activate_on_startup, None,
             "inactive clients omit the key rather than writing false"
         );
+    }
+
+    #[test]
+    fn control_mode_round_trips_through_toml() {
+        let written = ConfigToml {
+            control_mode: Some(ControlMode::ReceiveOnly),
+            ..Default::default()
+        };
+
+        let serialized = toml_edit::ser::to_string_pretty(&written).expect("serialize config");
+        assert_eq!(serialized, "control_mode = \"receive_only\"\n");
+
+        let reparsed: ConfigToml = toml::from_str(&serialized).expect("reparse written config");
+        assert_eq!(reparsed.control_mode, Some(ControlMode::ReceiveOnly));
+    }
+
+    #[test]
+    fn set_control_mode_is_persisted_by_write_back() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let config_dir = std::env::temp_dir().join(format!(
+            "crossdesk-control-mode-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&config_dir).expect("create temporary config directory");
+        let config_path = config_dir.join(CONFIG_FILE_NAME);
+        let cert_path = config_dir.join(CERT_FILE_NAME);
+        let (_watch_tx, watch_rx) = tokio::sync::mpsc::channel(1);
+        let watcher = RecommendedWatcher::new(
+            |_: Result<notify::Event, notify::Error>| {},
+            notify::Config::default(),
+        )
+        .expect("create config watcher");
+        let mut config = Config {
+            args: Args {
+                port: None,
+                config: None,
+                capture_backend: None,
+                emulation_backend: None,
+                cert_path: None,
+                command: None,
+            },
+            cert_path,
+            config_path: config_path.clone(),
+            config_dir: config_dir.clone(),
+            config_toml: Some(ConfigToml::default()),
+            watcher,
+            watch_rx,
+        };
+
+        assert_eq!(config.control_mode(), ControlMode::Bidirectional);
+        config.set_control_mode(ControlMode::SendOnly);
+        assert_eq!(config.control_mode(), ControlMode::SendOnly);
+        config.write_back().expect("write config");
+
+        let persisted: ConfigToml =
+            toml::from_str(&fs::read_to_string(&config_path).expect("read persisted config"))
+                .expect("parse persisted config");
+        assert_eq!(persisted.control_mode, Some(ControlMode::SendOnly));
+
+        drop(config);
+        fs::remove_file(&config_path).expect("remove temporary config file");
+        fs::remove_dir(&config_dir).expect("remove temporary config directory");
     }
 
     #[test]

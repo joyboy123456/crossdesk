@@ -20,6 +20,10 @@ impl PeerCapabilities {
         self.capabilities.borrow_mut().remove(&addr);
     }
 
+    pub(crate) fn known(&self, addr: SocketAddr) -> bool {
+        self.capabilities.borrow().contains_key(&addr)
+    }
+
     /// whether the peer at `addr` advertised all bits of `capability`
     pub(crate) fn supports(&self, addr: SocketAddr, capability: u32) -> bool {
         self.capabilities
@@ -42,13 +46,16 @@ mod tests {
 
     #[test]
     fn unknown_peer_supports_nothing() {
-        assert!(!PeerCapabilities::default().supports(addr(1), A));
+        let capabilities = PeerCapabilities::default();
+        assert!(!capabilities.known(addr(1)));
+        assert!(!capabilities.supports(addr(1), A));
     }
 
     #[test]
     fn supports_reports_advertised_bits_only() {
         let capabilities = PeerCapabilities::default();
         capabilities.set(addr(1), A);
+        assert!(capabilities.known(addr(1)));
         assert!(capabilities.supports(addr(1), A));
         assert!(!capabilities.supports(addr(1), B));
         assert!(!capabilities.supports(addr(1), A | B));

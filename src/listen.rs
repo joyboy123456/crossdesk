@@ -151,8 +151,6 @@ impl DtlsListener {
                         c = listener.accept() => match c {
                             Ok((conn, addr)) => {
                                 log::info!("dtls client connected, ip: {addr}");
-                                let mut conns = conns_clone.lock().await;
-                                conns.push((addr, conn.clone()));
                                 // This runs after the peer authenticated, so a
                                 // certificate is expected - but dropping one
                                 // connection beats aborting the service.
@@ -160,6 +158,24 @@ impl DtlsListener {
                                     log::warn!("could not read the certificate of {addr}");
                                     continue;
                                 };
+                                let replaced = {
+                                    let mut conns = conns_clone.lock().await;
+                                    let mut replaced = Vec::new();
+                                    let mut index = 0;
+                                    while index < conns.len() {
+                                        if conns[index].0 == addr {
+                                            replaced.push(conns.remove(index).1);
+                                        } else {
+                                            index += 1;
+                                        }
+                                    }
+                                    conns.push((addr, conn.clone()));
+                                    replaced
+                                };
+                                peer_capabilities_clone.remove(addr);
+                                for previous in replaced {
+                                    let _ = previous.close().await;
+                                }
                                 send(&listen_tx, "accepted connection", ListenEvent::Accept { addr, fingerprint });
                                 spawn_local(read_loop(
                                     conns_clone.clone(),
@@ -249,6 +265,28 @@ impl DtlsListener {
             if *a == addr {
                 let _ = conn.send(&buf[..len]).await;
             }
+        }
+    }
+
+    /// Close one peer after a control-session handshake timeout. Reconnecting
+    /// gives both sides a clean DTLS epoch and discards delayed datagrams.
+    pub(crate) async fn close_peer(&self, addr: SocketAddr) {
+        let conns_to_close = {
+            let mut conns = self.conns.lock().await;
+            let mut removed = Vec::new();
+            let mut index = 0;
+            while index < conns.len() {
+                if conns[index].0 == addr {
+                    removed.push(conns.remove(index).1);
+                } else {
+                    index += 1;
+                }
+            }
+            removed
+        };
+        self.peer_capabilities.remove(addr);
+        for conn in conns_to_close {
+            let _ = conn.close().await;
         }
     }
 
@@ -347,6 +385,14 @@ async fn read_loop(
     let mut b = vec![0u8; MAX_WIRE_SIZE];
 
     while let Ok(len) = conn.recv(&mut b).await {
+        let current =
+            conns.lock().await.iter().any(|(current_addr, current)| {
+                *current_addr == addr && Arc::ptr_eq(current, &conn)
+            });
+        if !current {
+            log::debug!("ignoring packet from stale incoming connection {addr}");
+            continue;
+        }
         let received_at = Timestamp::now();
         match decode_wire_event(&b[..len]) {
             Ok(event) => {
@@ -378,12 +424,17 @@ async fn read_loop(
         }
     }
     log::info!("dtls client disconnected {addr:?}");
-    peer_capabilities.remove(addr);
     let mut conns = conns.lock().await;
     // The entry may already be gone if the listener was torn down while this
     // read loop was still running.
-    if let Some(index) = conns.iter().position(|(a, _)| *a == addr) {
+    if let Some(index) = conns
+        .iter()
+        .position(|(a, current)| *a == addr && Arc::ptr_eq(current, &conn))
+    {
         conns.remove(index);
+        if !conns.iter().any(|(current_addr, _)| *current_addr == addr) {
+            peer_capabilities.remove(addr);
+        }
     }
     Ok(())
 }

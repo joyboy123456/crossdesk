@@ -274,7 +274,7 @@ target/release/lan-mouse.exe  10,976,768 bytes  PE subsystem 3 (Windows Console)
 
 ### 13. 文本剪贴板同步
 
-已实现 Windows/macOS 双向 UTF-8 文本剪贴板同步：后台线程每 350 ms 读取平台剪贴板，通过有界通道把变化交给服务；远端写入会更新去重状态，避免两端反复回传相同文本。同步默认开启，可在 CrossDesk 设置页或 `config.toml` 的 `clipboard_sync` 字段关闭。
+已实现 Windows/macOS 双向 UTF-8 文本剪贴板同步：独立读线程检测平台剪贴板，独立写线程处理远端文本，避免 macOS 通用剪贴板读取阻塞远端写入；macOS 每 50 ms 检查廉价的 `NSPasteboard.changeCount/types`，Windows/Linux 保持 350 ms 周期，仅在内容确实变化时读取正文。跨线程版本号会丢弃与远端写入重叠的陈旧读取，只有平台写入真正成功后才更新服务去重状态。同步默认开启，可在 CrossDesk 设置页或 `config.toml` 的 `clipboard_sync` 字段关闭。
 
 网络协议新增 Hello 能力位和最大 16 KiB 的可变长度文本包。新端只向声明支持的对端发送剪贴板包；旧端仍可解析 Hello 的提交哈希，不会收到超出旧接收缓冲区的文本包。`lan-mouse-proto` 与 `lan-mouse-ipc` 已相应升级至 `0.4.0`。
 
@@ -289,6 +289,12 @@ cargo build --release --workspace --all-features --target-dir "target/clipboard-
 ```
 
 结果：全部通过。工作区共 28 个单元测试通过，其中新增协议编解码/兼容/大小边界 4 个、IPC 往返 1 个、设置页交互 1 个；全部文档测试通过。独立 release 产物 `target/clipboard-sync-release/release/crossdesk.exe` 为 11,033,600 bytes。常规 `target/release/crossdesk.exe` 当时被两个正在运行的 CrossDesk 进程占用，因此未终止用户进程，改用独立目标目录完成完整 GUI 链接验证。
+
+2026-08-21 修复 macOS 通用剪贴板取数可阻塞 5–6 秒的问题：平台读取与远端写入已拆分，远端写入失败会保留最新值并持续退避重试，读取结果通过写入版本号和设置 epoch 防止陈旧回放。新增 7 个确定性并发回归测试，覆盖阻塞读取不阻塞写入、旧读取丢弃、写入持续重试、最新远端值优先、瞬时读取错误、快速启停及关停不等待读取；`cargo test --workspace --all-features`、全特性 Clippy 和 macOS release 工作区构建均通过。
+
+同日补充 macOS Handoff 占位项过滤：检测到 `com.apple.is-remote-clipboard` 类型时只消费 `changeCount`，不调用正文读取，从根源上避免 CrossDesk 主动触发“粘贴自另一台 Mac”的系统连接窗口；新的本地 token 仍正常读取，CrossDesk 收到的局域网文本仍由独立写线程落盘。两端现场验证中，远程 marker 在 CrossDesk 运行后持续保留且 change count 不变，证明占位内容未被实体化。
+
+同日修复 macOS 中文输入法组合态被 Caps Lock/修饰键污染的问题：源端把 Caps Lock 的逻辑锁变化转换为完整 pulse，并将 `locked` 与 `depressed` 分离；接收端用真实修饰键 keycode 构造 `FlagsChanged`，禁止 modifier 进入自动重复，快照仅对 old/new 差异执行恢复。Enter Ack 后会立即发送当前四字段 modifier 快照，500 ms 心跳可清理丢失的 key-up，不再周期性注入 keycode 0（字母 A）的伪事件。回归覆盖 Caps pulse 不残留、锁定态心跳、真实 keycode、禁止 autorepeat、同态快照不注入及 stuck modifier 清理。
 
 尚未执行 Windows/macOS 双机剪贴板互传实测；当前环境只有 Windows，且本地冒烟若直接写入系统剪贴板会覆盖用户内容。双机验收需覆盖纯英文、中文、多行代码、禁用开关、超过 16 KiB 的跳过行为，以及新版本连接旧版本时输入功能不受影响。
 

@@ -39,14 +39,14 @@ pub(crate) fn record_serialization(_started_at: Timestamp) {
 
 pub(crate) fn record_sent(_event: &ProtoEvent) {
     #[cfg(feature = "metrics")]
-    if let ProtoEvent::Input(event) = _event {
+    if let ProtoEvent::Input(event) | ProtoEvent::InputSession { event, .. } = _event {
         with_metrics(|metrics| metrics.sent.record(EventKind::of(event)));
     }
 }
 
 pub(crate) fn record_received(_event: &ProtoEvent) {
     #[cfg(feature = "metrics")]
-    if let ProtoEvent::Input(event) = _event {
+    if let ProtoEvent::Input(event) | ProtoEvent::InputSession { event, .. } = _event {
         with_metrics(|metrics| metrics.received.record(EventKind::of(event)));
     }
 }

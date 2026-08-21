@@ -272,6 +272,8 @@ By default `cargo run` starts the CrossDesk frontend. You can also run the dedic
 
 The **设备** page adds a host or IP and places it to the left, right, top, or bottom of the local screen. Enabled remote screens can also be dragged between the four available slots.
 
+The **设置** page selects this computer's role: **仅控制其他设备**, **仅允许被控制**, or **双向自动**. CrossDesk keeps the live role mutually exclusive, so a computer is never controlling a peer while it is also accepting remote input. The device page shows **正在控制** or **正在被控制** while a session is active and provides an immediate disconnect action. Existing configurations default to bidirectional mode.
+
 **添加设备** scans the LAN for running CrossDesk devices and prefills the selected device's hostname, IP and port; **手动添加** is still available for manual entry. Devices answer these discovery probes on the fixed UDP port `4243`, independent of the configured service port.
 
 On the remote device, use the **授权** page to approve the local device fingerprint. The local fingerprint is shown on the same page.
@@ -346,6 +348,10 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 
 # optional port (defaults to 4242)
 port = 4242
+
+# local role (bidirectional | send_only | receive_only)
+# omitted values keep the backward-compatible bidirectional behavior
+control_mode = "receive_only"
 
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic

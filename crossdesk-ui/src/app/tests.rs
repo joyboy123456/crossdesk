@@ -9,7 +9,7 @@ use crate::app::geometry::{
 use eframe::egui::{Pos2, Rect, Theme, Vec2};
 use egui::accesskit::Role;
 use egui_kittest::{Harness, kittest::Queryable as _};
-use lan_mouse_ipc::Position;
+use lan_mouse_ipc::{ControlMode, ControlState, Position};
 use std::time::{Duration, Instant};
 
 fn app_harness() -> Harness<'static, CrossDeskApp> {
@@ -118,6 +118,67 @@ fn clipboard_checkbox_sends_persistent_setting_request() {
         Some(FrontendRequest::SetClipboardSync(false))
     );
     assert!(!harness.state().state.clipboard_enabled);
+}
+
+#[test]
+fn control_mode_selector_sends_persistent_setting_request() {
+    let mut harness = app_harness();
+    harness.state_mut().page = Page::Settings;
+    harness.step();
+
+    for _ in 0..12 {
+        harness.get_by_label("仅允许被控制").scroll_down();
+    }
+    harness.run_steps(2);
+    harness.get_by_label("仅允许被控制").click();
+    harness.step();
+
+    assert_eq!(
+        harness.state().bridge.try_test_request(),
+        Some(FrontendRequest::SetControlMode(ControlMode::ReceiveOnly))
+    );
+    assert_eq!(harness.state().state.control_mode, ControlMode::ReceiveOnly);
+    harness.get_by_label("双向自动");
+    harness.get_by_label("高级");
+}
+
+#[test]
+fn controlled_by_banner_resolves_authorized_name_and_requests_disconnect() {
+    let mut harness = app_harness();
+    let addr = "192.168.1.42:4242".parse().expect("valid socket address");
+    harness
+        .state_mut()
+        .state
+        .authorized
+        .insert("aa:bb".into(), "MacBook".into());
+    harness.state_mut().state.control_state = ControlState::ControlledBy {
+        addr,
+        fingerprint: "aa:bb".into(),
+    };
+    harness.step();
+
+    harness.get_by_label("正在被 MacBook 控制");
+    harness.get_by_label("连接地址 192.168.1.42:4242");
+    harness
+        .get_by_role_and_label(Role::Button, "立即断开")
+        .click();
+    harness.step();
+
+    assert_eq!(
+        harness.state().bridge.try_test_request(),
+        Some(FrontendRequest::DisconnectControl)
+    );
+}
+
+#[test]
+fn controlling_device_row_replaces_online_status() {
+    let mut harness = app_harness();
+    add_active_screen(harness.state_mut(), 3, Position::Right, "Mac-mini-M4", true);
+    harness.state_mut().state.control_state = ControlState::Controlling { handle: 3 };
+    harness.step();
+
+    harness.get_by_label("正在控制 Mac-mini-M4");
+    harness.get_by_label("正在控制");
 }
 
 #[test]

@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{
     base::{CFRelease, TCFType, kCFAllocatorDefault},
-    date::CFTimeInterval,
     number::{CFBooleanRef, kCFBooleanTrue},
     runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes},
     string::{CFString, CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
@@ -19,11 +18,11 @@ use core_graphics::{
         CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
         CGEventTapPlacement, CGEventTapProxy, CGEventType, CallbackResult, EventField,
     },
-    event_source::{CGEventSource, CGEventSourceStateID},
 };
 use futures_core::Stream;
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
+    scancode,
 };
 use keycode::{KeyMap, KeyMapping};
 use libc::c_void;
@@ -42,6 +41,37 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
 };
+
+const CROSSDESK_ENTER_EVENT_TAG: i64 = 0x4352_4f53_5344_534b;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyntheticEnterAction {
+    ProcessNormally,
+    PassThrough,
+    Drop,
+}
+
+/// Decide how the capture tap handles CrossDesk's absolute enter placement.
+/// It must reach the window server while idle, but it must never start or feed
+/// a capture. If capture is already active, dropping it also prevents a
+/// conflicting peer from moving the hidden local cursor.
+fn synthetic_enter_action(
+    capture_active: bool,
+    event_type: CGEventType,
+    source_user_data: i64,
+) -> SyntheticEnterAction {
+    if !matches!(event_type, CGEventType::MouseMoved)
+        || source_user_data != CROSSDESK_ENTER_EVENT_TAG
+    {
+        return SyntheticEnterAction::ProcessNormally;
+    }
+
+    if capture_active {
+        SyntheticEnterAction::Drop
+    } else {
+        SyntheticEnterAction::PassThrough
+    }
+}
 
 #[derive(Debug, Default)]
 struct Bounds {
@@ -147,7 +177,10 @@ struct InputCaptureState {
 
 #[derive(Debug)]
 enum ProducerEvent {
-    Release(Option<f64>),
+    Release {
+        edge_ratio: Option<f64>,
+        completed: Option<oneshot::Sender<()>>,
+    },
     Create(Position),
     Destroy(Position),
     Grab(Position),
@@ -242,11 +275,14 @@ impl InputCaptureState {
     ) -> Result<(), CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
-            ProducerEvent::Release(edge_ratio) => {
+            ProducerEvent::Release {
+                edge_ratio,
+                completed,
+            } => {
                 if let Some(pos) = self.current_pos {
                     // place the cursor where the remote cursor crossed back
-                    // over the barrier (the warp suppression interval was
-                    // already lowered in configure_cf_settings)
+                    // over the barrier; point_on_edge keeps the warp target
+                    // 1pt inside rather than exactly on the barrier
                     if let Some(ratio) = edge_ratio {
                         let target = point_on_edge(&self.bounds, pos, ratio);
                         CGDisplay::warp_mouse_cursor_position(target)
@@ -254,6 +290,9 @@ impl InputCaptureState {
                     }
                     self.show_cursor()?;
                     self.current_pos = None;
+                }
+                if let Some(completed) = completed {
+                    let _ = completed.send(());
                 }
             }
             ProducerEvent::Grab(pos) => {
@@ -345,38 +384,15 @@ fn get_events(
             })));
         }
         CGEventType::FlagsChanged => {
-            let mut depressed = XMods::empty();
-            let mut mods_locked = XMods::empty();
-            let cg_flags = ev.get_flags();
-
-            if cg_flags.contains(CGEventFlags::CGEventFlagShift) {
-                depressed |= XMods::ShiftMask;
-            }
-            if cg_flags.contains(CGEventFlags::CGEventFlagControl) {
-                depressed |= XMods::ControlMask;
-            }
-            if cg_flags.contains(CGEventFlags::CGEventFlagAlternate) {
-                depressed |= XMods::Mod1Mask;
-            }
-            if cg_flags.contains(CGEventFlags::CGEventFlagCommand) {
-                depressed |= XMods::Mod4Mask;
-            }
-            if cg_flags.contains(CGEventFlags::CGEventFlagAlphaShift) {
-                depressed |= XMods::LockMask;
-                mods_locked |= XMods::LockMask;
-            }
-
-            // check if pressed or released
-            let state = if depressed > *modifier_state { 1 } else { 0 };
+            let (depressed, mods_locked) = modifier_masks(ev.get_flags());
             *modifier_state = depressed;
 
             if let Ok(key) = map_key(ev) {
-                let key_event = CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                    time: 0,
-                    key,
-                    state,
-                }));
-                result.push(key_event);
+                result.extend(
+                    modifier_key_events(key, depressed)
+                        .into_iter()
+                        .map(|event| CaptureEvent::Input(Event::Keyboard(event))),
+                );
             }
 
             let modifier_event = KeyboardEvent::Modifiers {
@@ -510,6 +526,63 @@ fn get_events(
     Ok(())
 }
 
+fn modifier_masks(flags: CGEventFlags) -> (XMods, XMods) {
+    let mut depressed = XMods::empty();
+    let mut locked = XMods::empty();
+    if flags.contains(CGEventFlags::CGEventFlagShift) {
+        depressed |= XMods::ShiftMask;
+    }
+    if flags.contains(CGEventFlags::CGEventFlagControl) {
+        depressed |= XMods::ControlMask;
+    }
+    if flags.contains(CGEventFlags::CGEventFlagAlternate) {
+        depressed |= XMods::Mod1Mask;
+    }
+    if flags.contains(CGEventFlags::CGEventFlagCommand) {
+        depressed |= XMods::Mod4Mask;
+    }
+    if flags.contains(CGEventFlags::CGEventFlagAlphaShift) {
+        locked |= XMods::LockMask;
+    }
+    (depressed, locked)
+}
+
+fn modifier_key_events(key: u32, depressed: XMods) -> Vec<KeyboardEvent> {
+    if scancode::Linux::try_from(key) == Ok(scancode::Linux::KeyCapsLock) {
+        // Quartz exposes Caps Lock's logical lock transition, not its physical
+        // press/release pair. Forward a pulse so it can never remain in the
+        // cross-device pressed-key set or enter key repeat.
+        return vec![
+            KeyboardEvent::Key {
+                time: 0,
+                key,
+                state: 1,
+            },
+            KeyboardEvent::Key {
+                time: 0,
+                key,
+                state: 0,
+            },
+        ];
+    }
+
+    let mask = scancode::Linux::try_from(key)
+        .map(|key| match key {
+            scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
+            scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
+            scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
+            scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
+            _ => XMods::empty(),
+        })
+        .unwrap_or_default();
+    let state = u8::from(!mask.is_empty() && depressed.contains(mask));
+    vec![KeyboardEvent::Key {
+        time: 0,
+        key,
+        state,
+    }]
+}
+
 fn create_event_tap<'a>(
     client_state: Arc<Mutex<InputCaptureState>>,
     notify_tx: Sender<ProducerEvent>,
@@ -597,6 +670,23 @@ fn create_event_tap<'a>(
             return CallbackResult::Keep;
         }
 
+        match synthetic_enter_action(
+            state.current_pos.is_some(),
+            event_type,
+            cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA),
+        ) {
+            SyntheticEnterAction::PassThrough => {
+                log::trace!("passing through CrossDesk synthetic enter event");
+                return CallbackResult::Keep;
+            }
+            SyntheticEnterAction::Drop => {
+                log::debug!("dropping CrossDesk synthetic enter event while capture is active");
+                cg_ev.set_type(CGEventType::Null);
+                return CallbackResult::Drop;
+            }
+            SyntheticEnterAction::ProcessNormally => {}
+        }
+
         // Are we in a client?
         if let Some(current_pos) = state.current_pos {
             capture_position = Some(current_pos);
@@ -635,6 +725,16 @@ fn create_event_tap<'a>(
                     }
                 };
                 res_events.push(CaptureEvent::Begin { ratio });
+                let (depressed, locked) = modifier_masks(cg_ev.get_flags());
+                state.modifier_state = depressed;
+                res_events.push(CaptureEvent::Input(Event::Keyboard(
+                    KeyboardEvent::Modifiers {
+                        depressed: depressed.bits(),
+                        latched: 0,
+                        locked: locked.bits(),
+                        group: 0,
+                    },
+                )));
                 notify_tx
                     .blocking_send(ProducerEvent::Grab(new_pos))
                     .expect("Failed to send notification");
@@ -642,6 +742,11 @@ fn create_event_tap<'a>(
         }
 
         if let Some(pos) = capture_position {
+            // Never hold the capture-state mutex while applying backpressure
+            // to the bounded event channel. Release/Destroy requests need the
+            // same mutex to restore local input; holding it across a blocking
+            // send can otherwise deadlock a full queue against release.
+            drop(state);
             res_events.iter().for_each(|e| {
                 // error must be ignored, since the event channel
                 // may already be closed when the InputCapture instance is dropped.
@@ -788,9 +893,7 @@ impl MacOSInputCapture {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
 
-        unsafe {
-            configure_cf_settings()?;
-        }
+        unsafe { configure_cursor_settings()? };
 
         log::info!("Enabling CGEvent tap");
         let event_tap_thread_state = state.clone();
@@ -891,32 +994,38 @@ impl Drop for MacOSInputCapture {
 #[async_trait]
 impl Capture for MacOSInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("creating capture, {pos}");
-            let _ = notify_tx.send(ProducerEvent::Create(pos)).await;
-            log::debug!("done !");
-        });
+        log::debug!("creating capture, {pos}");
+        self.notify_tx
+            .send(ProducerEvent::Create(pos))
+            .await
+            .map_err(|_| CaptureError::EventTapDisabled)?;
+        log::debug!("done !");
         Ok(())
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("destroying capture {pos}");
-            let _ = notify_tx.send(ProducerEvent::Destroy(pos)).await;
-            log::debug!("done !");
-        });
+        log::debug!("destroying capture {pos}");
+        self.notify_tx
+            .send(ProducerEvent::Destroy(pos))
+            .await
+            .map_err(|_| CaptureError::EventTapDisabled)?;
+        log::debug!("done !");
         Ok(())
     }
 
     async fn release(&mut self, edge_ratio: Option<f64>) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("notifying Release");
-            let _ = notify_tx.send(ProducerEvent::Release(edge_ratio)).await;
-        });
-        Ok(())
+        log::debug!("notifying Release");
+        let (completed_tx, completed_rx) = oneshot::channel();
+        self.notify_tx
+            .send(ProducerEvent::Release {
+                edge_ratio,
+                completed: Some(completed_tx),
+            })
+            .await
+            .map_err(|_| CaptureError::EventTapDisabled)?;
+        completed_rx
+            .await
+            .map_err(|_| CaptureError::EventTapDisabled)
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
@@ -953,10 +1062,6 @@ extern "C" {
 }
 
 extern "C" {
-    fn CGEventSourceSetLocalEventsSuppressionInterval(
-        event_source: CGEventSource,
-        seconds: CFTimeInterval,
-    );
     fn CGPreflightListenEventAccess() -> bool;
     fn CGRequestListenEventAccess() -> bool;
     /// Re-enable an event tap that was disabled by a
@@ -984,15 +1089,7 @@ extern "C" {
     fn AXIsProcessTrusted() -> bool;
 }
 
-unsafe fn configure_cf_settings() -> Result<(), MacosCaptureCreationError> {
-    // When we warp the cursor using CGWarpMouseCursorPosition local events are suppressed for a short time
-    // this leeds to the cursor not flowing when crossing back from a clinet, set this to to 0 stops the warp
-    // from working, set a low value by trial and error, 0.05s seems good. 0.25s is the default
-    let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
-        .map_err(|_| MacosCaptureCreationError::EventSourceCreation)?;
-    CGEventSourceSetLocalEventsSuppressionInterval(event_source, 0.05);
-    // FIXME Memory Leak
-
+unsafe fn configure_cursor_settings() -> Result<(), MacosCaptureCreationError> {
     // This is a private settings that allows the cursor to be hidden while in the background.
     // It is used by Barrier and other apps.
     let key = CString::new("SetsCursorInBackground").unwrap();
@@ -1032,7 +1129,13 @@ bitflags! {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bounds, Position, cg_line_scroll_to_wire, edge_ratio, point_on_edge};
+    use super::{
+        Bounds, CROSSDESK_ENTER_EVENT_TAG, Position, SyntheticEnterAction, XMods,
+        cg_line_scroll_to_wire, edge_ratio, modifier_key_events, modifier_masks, point_on_edge,
+        synthetic_enter_action,
+    };
+    use core_graphics::event::CGEventFlags;
+    use input_event::{KeyboardEvent, scancode};
 
     const BOUNDS: Bounds = Bounds {
         xmin: 0.0,
@@ -1040,6 +1143,33 @@ mod tests {
         ymin: 0.0,
         ymax: 982.0,
     };
+
+    #[test]
+    fn caps_lock_is_locked_not_depressed() {
+        let (depressed, locked) = modifier_masks(CGEventFlags::CGEventFlagAlphaShift);
+        assert!(depressed.is_empty());
+        assert_eq!(locked, XMods::LockMask);
+    }
+
+    #[test]
+    fn caps_lock_transition_is_forwarded_as_a_complete_pulse() {
+        let key = scancode::Linux::KeyCapsLock as u32;
+        assert_eq!(
+            modifier_key_events(key, XMods::empty()),
+            vec![
+                KeyboardEvent::Key {
+                    time: 0,
+                    key,
+                    state: 1,
+                },
+                KeyboardEvent::Key {
+                    time: 0,
+                    key,
+                    state: 0,
+                },
+            ]
+        );
+    }
 
     #[test]
     fn edge_ratio_spans_the_bounding_box() {
@@ -1095,5 +1225,45 @@ mod tests {
         assert_eq!(cg_line_scroll_to_wire(1, false), -1);
         assert_eq!(cg_line_scroll_to_wire(-1, false), 1);
         assert_eq!(cg_line_scroll_to_wire(0, false), 0);
+    }
+
+    #[test]
+    fn synthetic_enter_passes_through_without_starting_idle_capture() {
+        assert_eq!(
+            synthetic_enter_action(
+                false,
+                super::CGEventType::MouseMoved,
+                CROSSDESK_ENTER_EVENT_TAG,
+            ),
+            SyntheticEnterAction::PassThrough
+        );
+    }
+
+    #[test]
+    fn synthetic_enter_is_dropped_when_capture_is_already_active() {
+        assert_eq!(
+            synthetic_enter_action(
+                true,
+                super::CGEventType::MouseMoved,
+                CROSSDESK_ENTER_EVENT_TAG,
+            ),
+            SyntheticEnterAction::Drop
+        );
+    }
+
+    #[test]
+    fn real_motion_and_buttons_keep_the_normal_capture_path() {
+        assert_eq!(
+            synthetic_enter_action(false, super::CGEventType::MouseMoved, 0),
+            SyntheticEnterAction::ProcessNormally
+        );
+        assert_eq!(
+            synthetic_enter_action(
+                false,
+                super::CGEventType::LeftMouseDown,
+                CROSSDESK_ENTER_EVENT_TAG,
+            ),
+            SyntheticEnterAction::ProcessNormally
+        );
     }
 }

@@ -21,10 +21,10 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Align, Button, Color32, CornerRadius, Frame, Id, Layout, RichText, Sense, Stroke,
-    UiBuilder, Vec2, WidgetInfo, WidgetType,
+    self, Align, Align2, Button, Color32, CornerRadius, Frame, Id, Layout, Pos2, Rect, RichText,
+    Sense, Stroke, UiBuilder, Vec2, WidgetInfo, WidgetType,
 };
-use lan_mouse_ipc::{ClientHandle, FrontendEvent, FrontendRequest};
+use lan_mouse_ipc::{ClientHandle, ControlMode, ControlState, FrontendEvent, FrontendRequest};
 
 #[cfg(target_os = "macos")]
 use crate::macos_privacy::{self, PermissionState};
@@ -35,12 +35,12 @@ use crate::{
     tray::{TrayAction, TrayController},
 };
 
-const SIDEBAR_WIDTH: f32 = 200.0;
+const SIDEBAR_WIDTH: f32 = 216.0;
 const THEME_STORAGE_KEY: &str = "crossdesk_theme";
 
 use dialogs::{Editor, Notice, PendingPosition, ScanDialog};
 use fonts::install_fonts;
-use widgets::{icon, icon_button, nav_item};
+use widgets::{icon_button, nav_item};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Page {
@@ -289,38 +289,73 @@ impl CrossDeskApp {
         let palette = theme::palette(ui);
         let (rect, _) = ui.allocate_exact_size(Vec2::new(SIDEBAR_WIDTH, height), Sense::hover());
         ui.painter()
-            .rect_filled(rect, CornerRadius::ZERO, palette.surface);
+            .rect_filled(rect, CornerRadius::ZERO, palette.bg_canvas);
         ui.painter().vline(
             rect.right() - 0.5,
             rect.y_range(),
             Stroke::new(1.0, palette.border),
         );
 
-        let inner = rect.shrink2(Vec2::new(14.0, 18.0));
+        let inner = rect.shrink2(Vec2::new(16.0, 22.0));
         let mut nav = ui.new_child(
             UiBuilder::new()
                 .max_rect(inner)
                 .layout(Layout::top_down(Align::LEFT)),
         );
-        nav.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+        nav.spacing_mut().item_spacing = Vec2::new(8.0, 4.0);
 
+        // Brand mark: gradient monitor tile + wordmark + version caption.
         nav.horizontal(|ui| {
-            ui.label(icon("monitor", 20.0, palette.accent));
-            ui.label(RichText::new("CrossDesk").size(17.0).strong());
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let (tile, _) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::hover());
+            ui.painter()
+                .rect_filled(tile, CornerRadius::same(10), palette.accent);
+            ui.painter().rect_filled(
+                Rect::from_min_size(tile.min, Vec2::new(tile.width() / 2.0, tile.height())),
+                CornerRadius {
+                    nw: 10,
+                    ne: 0,
+                    sw: 10,
+                    se: 0,
+                },
+                palette.accent_hot.gamma_multiply(0.85),
+            );
+            ui.painter().text(
+                tile.center(),
+                Align2::CENTER_CENTER,
+                widgets::icon_glyph("monitor").0.to_string(),
+                theme::icon_font(&widgets::icon_glyph("monitor").1, 17.0),
+                Color32::WHITE,
+            );
+            ui.vertical(|ui| {
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new("CrossDesk")
+                        .size(16.0)
+                        .strong()
+                        .extra_letter_spacing(0.2),
+                );
+                ui.label(
+                    RichText::new("SOFTWARE KVM")
+                        .size(9.0)
+                        .extra_letter_spacing(2.4)
+                        .color(palette.text_muted),
+                );
+            });
         });
-        nav.add_space(22.0);
+        nav.add_space(30.0);
 
         for (page, icon_name, label) in [
-            (Page::Devices, "layout-grid", "设备"),
-            (Page::Authorization, "shield-check", "授权"),
-            (Page::Settings, "settings", "设置"),
+            (Page::Devices, "monitor", "设备"),
+            (Page::Authorization, "key-round", "授权"),
+            (Page::Settings, "settings-2", "设置"),
         ] {
             if nav_item(&mut nav, self.page, page, icon_name, label) {
                 self.page = page;
             }
         }
 
-        let remaining = nav.available_height() - 20.0;
+        let remaining = nav.available_height() - 34.0;
         if remaining > 0.0 {
             nav.add_space(remaining);
         }
@@ -329,16 +364,23 @@ impl CrossDeskApp {
         } else {
             (palette.warning, "正在重连")
         };
-        nav.horizontal(|ui| {
-            theme::status_dot(ui, color);
-            ui.label(
-                RichText::new(text)
-                    .size(theme::CAPTION_SIZE)
-                    .color(palette.text_secondary),
-            );
-        })
-        .response
-        .on_hover_text(&self.connection_detail);
+        Frame::new()
+            .fill(palette.surface)
+            .stroke(Stroke::new(1.0, palette.border))
+            .corner_radius(CornerRadius::same(theme::WIDGET_RADIUS))
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(&mut nav, |ui| {
+                ui.horizontal(|ui| {
+                    theme::status_dot(ui, color);
+                    ui.label(
+                        RichText::new(text)
+                            .size(theme::CAPTION_SIZE)
+                            .color(palette.text_secondary),
+                    );
+                })
+                .response
+                .on_hover_text(&self.connection_detail);
+            });
     }
 
     fn page_header(&mut self, ui: &mut egui::Ui) {
@@ -349,10 +391,20 @@ impl CrossDeskApp {
             Page::Settings => ("本机设置", "主题、端口、剪贴板与运行状态"),
         };
         ui.horizontal(|ui| {
-            ui.label(theme::title_text(title));
+            ui.vertical(|ui| {
+                ui.label(
+                    theme::caption_text(match self.page {
+                        Page::Devices => "WORKSPACE",
+                        Page::Authorization => "TRUST",
+                        Page::Settings => "SYSTEM",
+                    })
+                    .color(palette.accent),
+                );
+                ui.label(theme::title_text(title));
+            });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let (next_theme, icon_name, tooltip) = match self.selected_theme {
-                    egui::Theme::Dark => (egui::Theme::Light, "sun", "切换到亮色主题"),
+                    egui::Theme::Dark => (egui::Theme::Light, "sun-medium", "切换到亮色主题"),
                     egui::Theme::Light => (egui::Theme::Dark, "moon", "切换到暗色主题"),
                 };
                 let theme_button = icon_button(ui, icon_name, tooltip, palette.text_secondary);
@@ -361,23 +413,205 @@ impl CrossDeskApp {
                     self.selected_theme = next_theme;
                     ui.ctx().set_theme(next_theme);
                 }
-                if self.page == Page::Devices
-                    && ui
-                        .add(
-                            Button::new(RichText::new("添加设备").color(Color32::WHITE))
-                                .fill(palette.accent),
+                if self.page == Page::Devices {
+                    let add = ui.add(
+                        Button::new(
+                            RichText::new("添加设备")
+                                .color(palette.accent)
+                                .size(theme::BODY_SIZE)
+                                .strong(),
                         )
-                        .clicked()
-                {
-                    self.open_scanner(ui.ctx());
+                        .fill(palette.accent_soft)
+                        .stroke(Stroke::new(1.0, palette.accent.gamma_multiply(0.5)))
+                        .corner_radius(CornerRadius::same(theme::WIDGET_RADIUS)),
+                    );
+                    if add.hovered() {
+                        ui.painter().rect_stroke(
+                            add.rect.expand(2.0),
+                            CornerRadius::same(theme::WIDGET_RADIUS + 2),
+                            Stroke::new(1.5, palette.accent.gamma_multiply(0.25)),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                    if add.clicked() {
+                        self.open_scanner(ui.ctx());
+                    }
                 }
             });
         });
+        ui.add_space(2.0);
         ui.label(
             RichText::new(subtitle)
                 .size(theme::BODY_SIZE)
-                .color(palette.text_secondary),
+                .color(palette.text_muted),
         );
+        // Gradient hairline separating the header from the content.
+        let (line, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 2.0), Sense::hover());
+        let gradient_end = (line.width() * 0.25).min(120.0);
+        if gradient_end >= 1.0 {
+            theme::accent_gradient_line(
+                ui.painter(),
+                Rect::from_min_size(line.min, Vec2::new(gradient_end, 2.0))
+                    .shrink2(Vec2::new(0.0, 0.5)),
+                palette,
+            );
+        }
+        if line.width() > gradient_end {
+            ui.painter().rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(line.left() + gradient_end, line.top() + 0.5),
+                    Vec2::new(line.width() - gradient_end, 1.0),
+                ),
+                CornerRadius::ZERO,
+                palette.border,
+            );
+        }
+    }
+
+    fn control_status_banner(&mut self, ui: &mut egui::Ui) {
+        let palette = theme::palette(ui);
+        let (title, detail, color, icon_name, can_disconnect) = match &self.state.control_state {
+            ControlState::Idle => match self.state.control_mode {
+                ControlMode::ReceiveOnly => (
+                    "等待被控制".to_owned(),
+                    "本机仅接受已授权设备的控制".to_owned(),
+                    palette.success,
+                    "inbox",
+                    false,
+                ),
+                ControlMode::SendOnly => (
+                    "已启用，等待鼠标滑入".to_owned(),
+                    "移动鼠标到设备边缘开始控制".to_owned(),
+                    palette.accent,
+                    "mouse-pointer-2",
+                    false,
+                ),
+                ControlMode::Bidirectional => (
+                    "已启用，等待鼠标滑入".to_owned(),
+                    "双向自动已启用，同一时刻角色互斥".to_owned(),
+                    palette.accent,
+                    "arrow-left-right",
+                    false,
+                ),
+            },
+            ControlState::ReadyToReceive => (
+                "等待被控制".to_owned(),
+                "本机已准备接收已授权设备的输入".to_owned(),
+                palette.success,
+                "inbox",
+                false,
+            ),
+            ControlState::Controlling { handle } => {
+                let peer = self
+                    .state
+                    .clients
+                    .get(handle)
+                    .and_then(|client| client.config.hostname.as_deref())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("设备 #{handle}"));
+                (
+                    format!("正在控制 {peer}"),
+                    "本机键鼠输入正在发送到对端".to_owned(),
+                    palette.accent,
+                    "radio-tower",
+                    true,
+                )
+            }
+            ControlState::ControlledBy { addr, fingerprint } => {
+                let known_peer = self.state.authorized.get(fingerprint);
+                let peer = known_peer.cloned().unwrap_or_else(|| addr.to_string());
+                let detail = known_peer.map_or_else(
+                    || "远端键鼠正在控制本机".to_owned(),
+                    |_| format!("连接地址 {addr}"),
+                );
+                (
+                    format!("正在被 {peer} 控制"),
+                    detail,
+                    palette.success,
+                    "antenna",
+                    true,
+                )
+            }
+            ControlState::Switching => (
+                "正在切换".to_owned(),
+                "正在安全释放当前控制会话".to_owned(),
+                palette.warning,
+                "loader",
+                false,
+            ),
+        };
+
+        let mut disconnect = false;
+        Frame::new()
+            .fill(palette.surface)
+            .stroke(Stroke::new(1.0, palette.border))
+            .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
+            .inner_margin(egui::Margin::symmetric(18, 14))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    // Icon tile with tinted background.
+                    let (tile, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+                    ui.painter().rect_filled(
+                        tile,
+                        CornerRadius::same(12),
+                        color.gamma_multiply(0.12),
+                    );
+                    ui.painter().rect_stroke(
+                        tile,
+                        CornerRadius::same(12),
+                        Stroke::new(1.0, color.gamma_multiply(0.3)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let (glyph, family) = widgets::icon_glyph(icon_name);
+                    ui.painter().text(
+                        tile.center(),
+                        Align2::CENTER_CENTER,
+                        glyph.to_string(),
+                        theme::icon_font(&family, 18.0),
+                        color,
+                    );
+                    // Colored accent bar on the leading edge.
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(tile.min + Vec2::new(-14.0, 6.0), Vec2::new(3.0, 28.0)),
+                        CornerRadius::same(2),
+                        color,
+                    );
+                    ui.vertical(|ui| {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(title).size(15.0).strong().color(color));
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(detail)
+                                .size(theme::CAPTION_SIZE + 1.0)
+                                .color(palette.text_muted),
+                        );
+                    });
+                    if can_disconnect {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    Button::new(
+                                        RichText::new("立即断开")
+                                            .color(Color32::WHITE)
+                                            .size(theme::BODY_SIZE),
+                                    )
+                                    .fill(palette.danger)
+                                    .corner_radius(CornerRadius::same(theme::WIDGET_RADIUS)),
+                                )
+                                .clicked()
+                            {
+                                disconnect = true;
+                            }
+                        });
+                    }
+                });
+            });
+
+        if disconnect {
+            self.send(FrontendRequest::DisconnectControl);
+        }
     }
 
     fn handle_window_lifecycle(&mut self, ctx: &egui::Context) {
@@ -473,14 +707,16 @@ impl eframe::App for CrossDeskApp {
 
                 let content_rect = ui
                     .available_rect_before_wrap()
-                    .shrink2(Vec2::new(5.0, 18.0));
+                    .shrink2(Vec2::new(5.0, 14.0));
                 let mut content = ui.new_child(
                     UiBuilder::new()
                         .max_rect(content_rect)
                         .layout(Layout::top_down(Align::LEFT)),
                 );
                 self.page_header(&mut content);
-                content.add_space(10.0);
+                content.add_space(8.0);
+                self.control_status_banner(&mut content);
+                content.add_space(8.0);
 
                 // Fade + slide the page in whenever it changes.
                 let ctx = content.ctx().clone();

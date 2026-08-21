@@ -2,6 +2,7 @@ use super::{Emulation, EmulationHandle, Position, error::EmulationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::base::TCFType;
+use core_foundation::date::CFTimeInterval;
 use core_foundation::string::CFString;
 use core_foundation_sys::base::Boolean;
 use core_foundation_sys::preferences::{
@@ -33,6 +34,11 @@ use super::error::MacOSEmulationCreationError;
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const LOCAL_EVENTS_SUPPRESSION_INTERVAL: CFTimeInterval = 0.05;
+const PERMIT_ALL_LOCAL_EVENTS: u32 = 0x0000_0007;
+const SUPPRESSION_INTERVAL_STATE: u32 = 0;
+const REMOTE_MOUSE_DRAG_STATE: u32 = 1;
+const CROSSDESK_ENTER_EVENT_TAG: i64 = 0x4352_4f53_5344_534b;
 
 /// Convert the protocol's scroll convention (positive = down/right) to a
 /// CoreGraphics scroll delta. CG's base convention is the opposite sign,
@@ -133,6 +139,7 @@ impl MacOSEmulation {
 
         let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
+        configure_event_source(&event_source);
         Ok(Self {
             event_source,
             pressed_buttons: HashSet::new(),
@@ -201,6 +208,28 @@ impl MacOSEmulation {
     }
 }
 
+/// Keep physical input responsive while Quartz events from this source are
+/// being posted. These settings belong to the source used for HID injection;
+/// configuring a separate temporary source has no effect on these events.
+fn configure_event_source(event_source: &CGEventSource) {
+    unsafe {
+        CGEventSourceSetLocalEventsSuppressionInterval(
+            event_source.clone(),
+            LOCAL_EVENTS_SUPPRESSION_INTERVAL,
+        );
+        CGEventSourceSetLocalEventsFilterDuringSuppressionState(
+            event_source.clone(),
+            PERMIT_ALL_LOCAL_EVENTS,
+            SUPPRESSION_INTERVAL_STATE,
+        );
+        CGEventSourceSetLocalEventsFilterDuringSuppressionState(
+            event_source.clone(),
+            PERMIT_ALL_LOCAL_EVENTS,
+            REMOTE_MOUSE_DRAG_STATE,
+        );
+    }
+}
+
 fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
     // Request both permissions up front so the user sees both TCC prompts
     // on the first launch. See the matching comment in input-capture/src/
@@ -254,11 +283,29 @@ extern "C" {
     fn AXIsProcessTrusted() -> bool;
 }
 
+extern "C" {
+    fn CGEventSourceSetLocalEventsSuppressionInterval(
+        event_source: CGEventSource,
+        seconds: CFTimeInterval,
+    );
+    fn CGEventSourceSetLocalEventsFilterDuringSuppressionState(
+        event_source: CGEventSource,
+        filter: u32,
+        state: u32,
+    );
+}
+
 /// Mac virtual key codes for the four arrow keys.
 const MAC_KEY_LEFT: u16 = 0x7B;
 const MAC_KEY_RIGHT: u16 = 0x7C;
 const MAC_KEY_DOWN: u16 = 0x7D;
 const MAC_KEY_UP: u16 = 0x7E;
+const MAC_KEY_LEFT_COMMAND: u16 = 0x37;
+const MAC_KEY_LEFT_SHIFT: u16 = 0x38;
+const MAC_KEY_CAPS_LOCK: u16 = 0x39;
+const MAC_KEY_LEFT_OPTION: u16 = 0x3A;
+const MAC_KEY_LEFT_CONTROL: u16 = 0x3B;
+const MAC_KEY_RIGHT_OPTION: u16 = 0x3D;
 
 fn is_arrow_key(key: u16) -> bool {
     matches!(
@@ -288,16 +335,78 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
     log::trace!("key event: {key} {state}");
 }
 
-fn modifier_event(event_source: CGEventSource, depressed: XMods) {
-    let Ok(event) = CGEvent::new(event_source) else {
-        log::warn!("could not create CGEvent");
+fn modifier_key_event(event_source: CGEventSource, key: u16, depressed: XMods) {
+    let Ok(event) = build_modifier_key_event(event_source, key, depressed) else {
+        log::warn!("could not create modifier key event");
         return;
     };
-    let flags = to_cgevent_flags(depressed);
-    event.set_type(CGEventType::FlagsChanged);
-    event.set_flags(flags);
     event.post(CGEventTapLocation::HID);
-    log::trace!("modifiers updated: {depressed:?}");
+    log::trace!("modifier key event: {key} {depressed:?}");
+}
+
+fn build_modifier_key_event(
+    event_source: CGEventSource,
+    key: u16,
+    depressed: XMods,
+) -> Result<CGEvent, ()> {
+    let event = CGEvent::new_keyboard_event(event_source, key, true)?;
+    event.set_type(CGEventType::FlagsChanged);
+    event.set_flags(modifier_flags_changed_flags(depressed));
+    Ok(event)
+}
+
+fn modifier_flags_changed_flags(depressed: XMods) -> CGEventFlags {
+    const NX_DEVICE_L_CTRL: u64 = 0x0000_0001;
+    const NX_DEVICE_L_SHIFT: u64 = 0x0000_0002;
+    const NX_DEVICE_L_CMD: u64 = 0x0000_0008;
+    const NX_DEVICE_L_ALT: u64 = 0x0000_0020;
+    const NX_DEVICE_R_ALT: u64 = 0x0000_0040;
+
+    let mut device_bits = 0;
+    if depressed.contains(XMods::ShiftMask) {
+        device_bits |= NX_DEVICE_L_SHIFT;
+    }
+    if depressed.contains(XMods::ControlMask) {
+        device_bits |= NX_DEVICE_L_CTRL;
+    }
+    if depressed.contains(XMods::Mod1Mask) {
+        device_bits |= NX_DEVICE_L_ALT;
+    }
+    if depressed.contains(XMods::Mod5Mask) {
+        device_bits |= NX_DEVICE_R_ALT;
+    }
+    if depressed.contains(XMods::Mod4Mask) {
+        device_bits |= NX_DEVICE_L_CMD;
+    }
+
+    let flags = to_cgevent_flags(depressed) | CGEventFlags::CGEventFlagNonCoalesced;
+    CGEventFlags::from_bits_retain(flags.bits() | device_bits)
+}
+
+fn reconcile_modifiers(event_source: CGEventSource, previous: XMods, desired: XMods) {
+    for (keycode, current) in modifier_transitions(previous, desired) {
+        modifier_key_event(event_source.clone(), keycode, current);
+    }
+}
+
+fn modifier_transitions(previous: XMods, desired: XMods) -> Vec<(u16, XMods)> {
+    let mut current = previous;
+    let mut transitions = Vec::new();
+    for (mask, keycode) in [
+        (XMods::ControlMask, MAC_KEY_LEFT_CONTROL),
+        (XMods::ShiftMask, MAC_KEY_LEFT_SHIFT),
+        (XMods::Mod1Mask, MAC_KEY_LEFT_OPTION),
+        (XMods::Mod5Mask, MAC_KEY_RIGHT_OPTION),
+        (XMods::Mod4Mask, MAC_KEY_LEFT_COMMAND),
+        (XMods::LockMask, MAC_KEY_CAPS_LOCK),
+    ] {
+        if previous.contains(mask) == desired.contains(mask) {
+            continue;
+        }
+        current.set(mask, desired.contains(mask));
+        transitions.push((keycode, current));
+    }
+    transitions
 }
 
 fn get_display_at_point(x: CGFloat, y: CGFloat) -> Option<CGDirectDisplayID> {
@@ -591,12 +700,19 @@ impl Emulation for MacOSEmulation {
                     };
                     let is_modifier = update_modifiers(&self.modifier_state, key, state);
                     if is_modifier {
-                        modifier_event(self.event_source.clone(), self.modifier_state.get());
-                    }
-                    match state {
-                        // pressed
-                        1 => self.spawn_repeat_task(code).await,
-                        _ => self.release_key(code).await,
+                        if !is_caps_lock_release(key, state) {
+                            modifier_key_event(
+                                self.event_source.clone(),
+                                code,
+                                self.modifier_state.get(),
+                            );
+                        }
+                    } else {
+                        match state {
+                            // pressed
+                            1 => self.spawn_repeat_task(code).await,
+                            _ => self.release_key(code).await,
+                        }
                     }
                 }
                 KeyboardEvent::Modifiers {
@@ -605,8 +721,9 @@ impl Emulation for MacOSEmulation {
                     locked,
                     group,
                 } => {
-                    set_modifiers(&self.modifier_state, depressed, latched, locked, group);
-                    modifier_event(self.event_source.clone(), self.modifier_state.get());
+                    let (previous, desired) =
+                        set_modifiers(&self.modifier_state, depressed, latched, locked, group);
+                    reconcile_modifiers(self.event_source.clone(), previous, desired);
                 }
             },
         }
@@ -663,6 +780,16 @@ impl Emulation for MacOSEmulation {
                 return;
             }
         };
+        // The local capture tap also observes HID-posted events. Mark this
+        // absolute placement so it can pass through without interpreting the
+        // edge location and large synthetic delta as a fresh local crossing.
+        event.set_integer_value_field(
+            EventField::EVENT_SOURCE_USER_DATA,
+            CROSSDESK_ENTER_EVENT_TAG,
+        );
+        event.set_flags(
+            to_cgevent_flags(self.modifier_state.get()) | CGEventFlags::CGEventFlagNonCoalesced,
+        );
         event.post(CGEventTapLocation::HID);
     }
 }
@@ -707,9 +834,16 @@ fn point_on_edge(
 
 fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
     if let Ok(key) = scancode::Linux::try_from(key) {
+        if matches!(key, scancode::Linux::KeyCapsLock) {
+            if state == 1 {
+                let mut mods = modifiers.get();
+                mods.toggle(XMods::LockMask);
+                modifiers.set(mods);
+            }
+            return true;
+        }
         let mask = match key {
             scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
-            scancode::Linux::KeyCapsLock => XMods::LockMask,
             scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
             scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
             scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
@@ -731,20 +865,25 @@ fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
     }
 }
 
+fn is_caps_lock_release(key: u32, state: u8) -> bool {
+    state == 0 && scancode::Linux::try_from(key) == Ok(scancode::Linux::KeyCapsLock)
+}
+
 fn set_modifiers(
     active_modifiers: &Cell<XMods>,
     depressed: u32,
     latched: u32,
     locked: u32,
     group: u32,
-) {
+) -> (XMods, XMods) {
     let depressed = XMods::from_bits(depressed).unwrap_or_default();
-    let _latched = XMods::from_bits(latched).unwrap_or_default();
-    let _locked = XMods::from_bits(locked).unwrap_or_default();
+    let latched = XMods::from_bits(latched).unwrap_or_default();
+    let locked = XMods::from_bits(locked).unwrap_or_default();
     let _group = XMods::from_bits(group).unwrap_or_default();
 
-    // we only care about the depressed modifiers for now
-    active_modifiers.replace(depressed);
+    let desired = depressed | latched | locked;
+    let previous = active_modifiers.replace(desired);
+    (previous, desired)
 }
 
 fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
@@ -758,7 +897,7 @@ fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
     if depressed.contains(XMods::ControlMask) {
         flags |= CGEventFlags::CGEventFlagControl;
     }
-    if depressed.contains(XMods::Mod1Mask) {
+    if depressed.contains(XMods::Mod1Mask) || depressed.contains(XMods::Mod5Mask) {
         flags |= CGEventFlags::CGEventFlagAlternate;
     }
     if depressed.contains(XMods::Mod4Mask) {
@@ -785,9 +924,82 @@ bitflags! {
 
 #[cfg(test)]
 mod tests {
-    use super::{Position, point_on_edge, wire_scroll_to_cgevent};
+    use super::{
+        MAC_KEY_CAPS_LOCK, Position, XMods, build_modifier_key_event, is_caps_lock_release,
+        modifier_transitions, point_on_edge, set_modifiers, to_cgevent_flags, update_modifiers,
+        wire_scroll_to_cgevent,
+    };
+    use core_graphics::{
+        event::{CGEventFlags, CGEventType, EventField},
+        event_source::{CGEventSource, CGEventSourceStateID},
+    };
+    use input_event::scancode;
+    use std::cell::Cell;
 
     const BOUNDS: (f64, f64, f64, f64) = (0.0, 0.0, 1512.0, 982.0);
+
+    #[test]
+    fn caps_lock_toggles_on_down_and_ignores_up() {
+        let modifiers = Cell::new(XMods::empty());
+        let key = scancode::Linux::KeyCapsLock as u32;
+
+        assert!(update_modifiers(&modifiers, key, 1));
+        assert_eq!(modifiers.get(), XMods::LockMask);
+        assert!(update_modifiers(&modifiers, key, 0));
+        assert_eq!(modifiers.get(), XMods::LockMask);
+        assert!(is_caps_lock_release(key, 0));
+
+        assert!(update_modifiers(&modifiers, key, 1));
+        assert!(modifiers.get().is_empty());
+    }
+
+    #[test]
+    fn modifier_snapshot_preserves_locked_state_and_altgr() {
+        let modifiers = Cell::new(XMods::empty());
+        set_modifiers(
+            &modifiers,
+            XMods::Mod5Mask.bits(),
+            0,
+            XMods::LockMask.bits(),
+            0,
+        );
+        assert_eq!(modifiers.get(), XMods::Mod5Mask | XMods::LockMask);
+        let flags = to_cgevent_flags(modifiers.get());
+        assert!(flags.contains(CGEventFlags::CGEventFlagAlternate));
+        assert!(flags.contains(CGEventFlags::CGEventFlagAlphaShift));
+    }
+
+    #[test]
+    fn unchanged_heartbeat_posts_nothing_and_locked_delta_uses_caps_keycode() {
+        assert!(modifier_transitions(XMods::empty(), XMods::empty()).is_empty());
+        assert_eq!(
+            modifier_transitions(XMods::empty(), XMods::LockMask),
+            vec![(MAC_KEY_CAPS_LOCK, XMods::LockMask)]
+        );
+        assert_eq!(
+            modifier_transitions(XMods::LockMask, XMods::empty()),
+            vec![(MAC_KEY_CAPS_LOCK, XMods::empty())]
+        );
+    }
+
+    #[test]
+    fn modifier_event_carries_real_keycode_and_never_autorepeats() {
+        let source =
+            CGEventSource::new(CGEventSourceStateID::CombinedSessionState).expect("event source");
+        let keycode = 56;
+        let event =
+            build_modifier_key_event(source, keycode, XMods::ShiftMask).expect("modifier event");
+
+        assert_eq!(event.get_type() as u32, CGEventType::FlagsChanged as u32);
+        assert_eq!(
+            event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE),
+            i64::from(keycode)
+        );
+        assert_eq!(
+            event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT),
+            0
+        );
+    }
 
     #[test]
     fn point_on_edge_maps_ratio_along_the_edge() {

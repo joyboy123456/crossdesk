@@ -1,4 +1,5 @@
 mod clipboard_state;
+pub(crate) mod control;
 mod hooks;
 mod incoming;
 mod keys;
@@ -17,12 +18,13 @@ use crate::{
     task::{Receiver, Sender, channel, send},
 };
 use clipboard_state::{ClipboardAction, ClipboardState};
+use control::{ControlArbiter, ControlSession, pending_mode};
 use futures::StreamExt;
 use incoming::{IncomingTracker, Registration};
 use keys::AuthorizedKeys;
 use lan_mouse_ipc::{
-    AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, Status,
+    AsyncFrontendListener, ClientHandle, ControlMode, ControlState, FrontendEvent, FrontendRequest,
+    IpcError, IpcListenerCreationError, Position, Status,
 };
 use std::{
     collections::HashSet,
@@ -46,6 +48,12 @@ pub enum ServiceError {
     ListenError(#[from] ListenerCreationError),
     #[error("failed to load certificate: `{0}`")]
     Certificate(#[from] crypto::Error),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingDisconnect {
+    Outgoing(ClientHandle),
+    Incoming(SocketAddr),
 }
 
 /// The daemon: owns every subsystem and routes events between them.
@@ -81,6 +89,14 @@ pub struct Service {
     authorized_keys: AuthorizedKeys,
     /// clipboard synchronization state and loop suppression
     clipboard_state: ClipboardState,
+    /// configured role and the one active control direction
+    control_session: ControlSession,
+    /// synchronous direction and mode gate shared by capture/emulation
+    control_arbiter: ControlArbiter,
+    /// outgoing barriers currently installed in the capture backend
+    outgoing_capture_barriers: HashSet<ClientHandle>,
+    pending_disconnect: Option<PendingDisconnect>,
+    pending_control_mode: Option<ControlMode>,
 
     /// current port
     port: u16,
@@ -112,6 +128,8 @@ impl Service {
         let frontend_listener = AsyncFrontendListener::new().await?;
 
         let authorized_keys = AuthorizedKeys::new(config.authorized_fingerprints());
+        let control_mode = config.control_mode();
+        let control_arbiter = ControlArbiter::new(control_mode);
         // listener + connection
         let listener =
             DtlsListener::new(config.port(), cert.clone(), authorized_keys.shared()).await?;
@@ -119,9 +137,19 @@ impl Service {
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
-        let capture = Capture::new(capture_backend, conn, config.release_bind());
+        let capture = Capture::new(
+            capture_backend,
+            conn,
+            config.release_bind(),
+            control_arbiter.clone(),
+        );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let emulation = Emulation::new(
+            emulation_backend,
+            listener,
+            control_mode != ControlMode::SendOnly,
+            control_arbiter.clone(),
+        );
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -152,6 +180,11 @@ impl Service {
             shutdown_requested: false,
             clipboard,
             clipboard_state: ClipboardState::new(clipboard_enabled),
+            control_session: ControlSession::new(control_mode),
+            control_arbiter,
+            outgoing_capture_barriers: HashSet::new(),
+            pending_disconnect: None,
+            pending_control_mode: None,
         };
         Ok(service)
     }
@@ -168,6 +201,7 @@ impl Service {
         for handle in active {
             self.activate_client(handle);
         }
+        self.refresh_control_policy();
 
         while !self.shutdown_requested {
             tokio::select! {
@@ -261,6 +295,12 @@ impl Service {
                 self.set_clipboard_enabled(enabled);
                 self.save_config();
             }
+            FrontendRequest::GetControlMode => {
+                self.notify_frontend(FrontendEvent::ControlMode(self.control_session.mode()));
+                self.notify_control_state();
+            }
+            FrontendRequest::SetControlMode(mode) => self.set_control_mode(mode),
+            FrontendRequest::DisconnectControl => self.disconnect_control(),
             FrontendRequest::Enumerate() => self.enumerate(),
             FrontendRequest::UpdateFixIps(handle, fix_ips) => {
                 self.update_fix_ips(handle, fix_ips);
@@ -314,6 +354,7 @@ impl Service {
     }
 
     fn handle_config_change(&mut self) {
+        self.apply_control_mode(self.config.control_mode());
         for h in self.client_manager.registered_clients() {
             self.remove_client(h);
         }
@@ -334,6 +375,7 @@ impl Service {
         self.authorized_keys
             .replace(&self.config.authorized_fingerprints());
         self.set_clipboard_enabled(self.config.clipboard_sync());
+        self.refresh_control_policy();
         self.sync_frontend();
     }
 
@@ -346,12 +388,9 @@ impl Service {
                 addr,
                 pos,
                 fingerprint,
-            } => self.register_incoming(addr, pos, fingerprint),
-            EmulationEvent::Disconnected { addr } => {
-                if let Some(target) = self.incoming.remove(addr) {
-                    self.capture.destroy(target);
-                    self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
-                }
+            } => self.handle_incoming_enter(addr, pos, fingerprint),
+            EmulationEvent::Left { addr } | EmulationEvent::Disconnected { addr } => {
+                self.finish_incoming_control(addr)
             }
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
@@ -365,6 +404,17 @@ impl Service {
             EmulationEvent::EmulationDisabled => {
                 self.emulation_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
+                if matches!(
+                    self.pending_disconnect,
+                    Some(PendingDisconnect::Incoming(_))
+                ) {
+                    self.complete_disconnect();
+                } else if matches!(
+                    self.control_session.state(),
+                    ControlState::ControlledBy { .. }
+                ) {
+                    self.disconnect_control();
+                }
             }
             EmulationEvent::EmulationEnabled => {
                 self.emulation_status = Status::Enabled;
@@ -386,6 +436,44 @@ impl Service {
                 }
             }
             EmulationEvent::ClipboardText(text) => self.apply_remote_clipboard(text),
+        }
+    }
+
+    fn handle_incoming_enter(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
+        if !self
+            .control_session
+            .begin_controlled(addr, fingerprint.clone())
+        {
+            log::warn!("rejecting controller {addr}: another control direction is active");
+            self.emulation.disconnect(addr);
+            return;
+        }
+
+        // Restore local input first, then remove outgoing barriers. This keeps
+        // the receiver role from overlapping with an outgoing capture even if
+        // the two task event streams arrive in the same scheduler turn.
+        self.capture.release();
+        self.refresh_control_policy();
+        self.register_incoming(addr, pos, fingerprint);
+        self.notify_control_state();
+    }
+
+    fn finish_incoming_control(&mut self, addr: SocketAddr) {
+        if let Some(target) = self.incoming.remove(addr) {
+            self.capture.destroy(target);
+            self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
+        }
+
+        let was_active = matches!(
+            self.control_session.state(),
+            ControlState::ControlledBy {
+                addr: current,
+                ..
+            } if *current == addr
+        );
+        let was_pending = self.pending_disconnect == Some(PendingDisconnect::Incoming(addr));
+        if was_active || was_pending {
+            self.complete_disconnect();
         }
     }
 
@@ -422,21 +510,58 @@ impl Service {
                 // => notify it that its capture should be released, telling
                 // it where along the barrier the cursor crossed
                 if let Some(addr) = self.incoming.addr_of(target) {
-                    self.emulation.send_leave_event(addr, ratio);
+                    if matches!(
+                        self.control_session.state(),
+                        ControlState::ControlledBy {
+                            addr: current,
+                            ..
+                        } if *current == addr
+                    ) {
+                        self.emulation.send_leave_event(addr, ratio);
+                    }
                 }
             }
             ICaptureEvent::CaptureDisabled => {
                 self.capture_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+                if matches!(
+                    self.control_session.state(),
+                    ControlState::Controlling { .. }
+                ) || matches!(
+                    self.pending_disconnect,
+                    Some(PendingDisconnect::Outgoing(_))
+                ) {
+                    self.complete_disconnect();
+                }
             }
             ICaptureEvent::CaptureEnabled => {
                 self.capture_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
             ICaptureEvent::ClientEntered(handle) => {
-                log::info!("entering client {handle} ...");
-                if let Some(cmd) = self.client_manager.get_enter_cmd(handle) {
-                    hooks::spawn(cmd);
+                if self.control_session.begin_controlling(handle) {
+                    log::info!("entering client {handle} ...");
+                    self.refresh_control_policy();
+                    self.notify_control_state();
+                    if let Some(cmd) = self.client_manager.get_enter_cmd(handle) {
+                        hooks::spawn(cmd);
+                    }
+                } else {
+                    log::warn!(
+                        "releasing capture for client {handle}: control role is unavailable"
+                    );
+                    self.capture.release();
+                }
+            }
+            ICaptureEvent::ClientLeft(handle) => {
+                let was_active = matches!(
+                    self.control_session.state(),
+                    ControlState::Controlling { handle: current } if *current == handle
+                );
+                let was_pending =
+                    self.pending_disconnect == Some(PendingDisconnect::Outgoing(handle));
+                if was_active || was_pending {
+                    self.complete_disconnect();
                 }
             }
             ICaptureEvent::ClipboardText(text) => self.apply_remote_clipboard(text),
@@ -476,6 +601,8 @@ impl Service {
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
         ));
+        self.notify_frontend(FrontendEvent::ControlMode(self.control_session.mode()));
+        self.notify_control_state();
         self.notify_clipboard_state();
         let keys = self.authorized_keys.snapshot();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
@@ -532,7 +659,7 @@ impl Service {
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
         if self.client_manager.deactivate_client(handle) {
-            self.capture.destroy(CaptureTarget::Client(handle));
+            self.remove_outgoing_capture_barrier(handle);
             self.broadcast_client(handle);
             log::info!("deactivated client {handle}");
         }
@@ -558,8 +685,7 @@ impl Service {
         /* activate the client */
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
-            self.capture
-                .create(CaptureTarget::Client(handle), pos, CaptureType::Default);
+            self.sync_outgoing_capture_barriers();
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
         }
@@ -580,7 +706,7 @@ impl Service {
             .map(|(_, s)| s.active)
             .unwrap_or(false)
         {
-            self.capture.destroy(CaptureTarget::Client(handle));
+            self.remove_outgoing_capture_barrier(handle);
         }
         self.notify_frontend(FrontendEvent::Deleted(handle));
     }
@@ -617,6 +743,137 @@ impl Service {
         self.broadcast_client(handle);
     }
 
+    fn set_control_mode(&mut self, mode: ControlMode) {
+        self.config.set_control_mode(mode);
+        self.apply_control_mode(mode);
+        self.save_config();
+    }
+
+    fn apply_control_mode(&mut self, mode: ControlMode) {
+        // Update the task-shared permission gate synchronously. Barrier and
+        // listener requests below are asynchronous optimizations, not the
+        // security/safety boundary.
+        self.control_arbiter.set_mode(mode);
+        self.notify_frontend(FrontendEvent::ControlMode(mode));
+
+        if self.pending_disconnect.is_some()
+            || matches!(self.control_session.state(), ControlState::Switching)
+        {
+            self.pending_control_mode = pending_mode(self.control_session.mode(), mode);
+            return;
+        }
+
+        if self.control_session.mode() != mode {
+            if matches!(
+                self.control_session.state(),
+                ControlState::Idle | ControlState::ReadyToReceive
+            ) {
+                self.control_session.set_mode(mode);
+                self.refresh_control_policy();
+                self.notify_control_state();
+            } else {
+                self.pending_control_mode = Some(mode);
+                self.disconnect_control();
+            }
+        }
+    }
+
+    fn disconnect_control(&mut self) {
+        if self.pending_disconnect.is_some() {
+            return;
+        }
+
+        match self.control_session.state().clone() {
+            ControlState::Controlling { handle } => {
+                self.pending_disconnect = Some(PendingDisconnect::Outgoing(handle));
+                self.control_session.begin_switching();
+                self.notify_control_state();
+                self.refresh_control_policy();
+                self.capture.release();
+            }
+            ControlState::ControlledBy { addr, .. } => {
+                self.pending_disconnect = Some(PendingDisconnect::Incoming(addr));
+                self.control_session.begin_switching();
+                self.notify_control_state();
+                self.refresh_control_policy();
+                self.emulation.disconnect(addr);
+            }
+            ControlState::Idle | ControlState::ReadyToReceive => {
+                self.apply_pending_control_mode();
+            }
+            ControlState::Switching => {}
+        }
+    }
+
+    fn complete_disconnect(&mut self) {
+        self.pending_disconnect = None;
+        if !self.apply_pending_control_mode() {
+            self.control_session.reset();
+        }
+        self.refresh_control_policy();
+        self.notify_control_state();
+    }
+
+    /// Returns whether a queued mode was applied.
+    fn apply_pending_control_mode(&mut self) -> bool {
+        let Some(mode) = self.pending_control_mode.take() else {
+            return false;
+        };
+        self.control_session.set_mode(mode);
+        true
+    }
+
+    fn refresh_control_policy(&mut self) {
+        self.emulation
+            .set_accepting_control(self.control_session.may_accept_controller());
+        self.sync_outgoing_capture_barriers();
+    }
+
+    fn sync_outgoing_capture_barriers(&mut self) {
+        let desired = if self.control_session.wants_outgoing_barriers() {
+            self.client_manager
+                .active_clients()
+                .into_iter()
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+
+        let stale = self
+            .outgoing_capture_barriers
+            .difference(&desired)
+            .copied()
+            .collect::<Vec<_>>();
+        for handle in stale {
+            self.remove_outgoing_capture_barrier(handle);
+        }
+
+        let missing = desired
+            .difference(&self.outgoing_capture_barriers)
+            .copied()
+            .collect::<Vec<_>>();
+        for handle in missing {
+            let Some(pos) = self.client_manager.get_pos(handle) else {
+                continue;
+            };
+            self.capture
+                .create(CaptureTarget::Client(handle), pos, CaptureType::Default);
+            self.outgoing_capture_barriers.insert(handle);
+        }
+    }
+
+    fn remove_outgoing_capture_barrier(&mut self, handle: ClientHandle) {
+        if self.outgoing_capture_barriers.remove(&handle) {
+            self.capture.destroy(CaptureTarget::Client(handle));
+        }
+    }
+
+    fn notify_control_state(&mut self) {
+        self.notify_frontend(FrontendEvent::ControlState(
+            self.control_session.state().clone(),
+        ));
+    }
+
     fn broadcast_client(&mut self, handle: ClientHandle) {
         let event = self
             .client_manager
@@ -636,18 +893,21 @@ impl Service {
                 let action = self.clipboard_state.on_local_text(text);
                 self.apply_clipboard_action(action);
             }
+            ClipboardEvent::RemoteTextApplied(text) => {
+                if self.clipboard_state.enabled() {
+                    let action = self.clipboard_state.on_remote_text_applied(text);
+                    self.apply_clipboard_action(action);
+                }
+            }
         }
     }
 
     fn apply_remote_clipboard(&mut self, text: String) {
-        if !self.clipboard_state.accepts_remote_text(&text) {
+        if !self.clipboard_state.enabled() {
             return;
         }
-        log::debug!("applying remote clipboard text ({} bytes)", text.len());
-        if self.clipboard.apply(text.clone()) {
-            let action = self.clipboard_state.on_remote_text_applied(text);
-            self.apply_clipboard_action(action);
-        }
+        log::debug!("queueing remote clipboard text ({} bytes)", text.len());
+        self.clipboard.queue_remote_text(text);
     }
 
     fn set_clipboard_enabled(&mut self, enabled: bool) {

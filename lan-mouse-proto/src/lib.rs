@@ -9,10 +9,9 @@ use thiserror::Error;
 
 pub mod discovery;
 
-/// defines the maximum size an encoded event can take up
-/// this is currently the pointer motion event
-/// type: u8, time: u32, dx: f64, dy: f64
-pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
+/// Maximum fixed-size protocol packet. A scoped input wraps the largest
+/// legacy input payload with its own type byte and session serial.
+pub const MAX_EVENT_SIZE: usize = 2 * size_of::<u8>() + 2 * size_of::<u32>() + 2 * size_of::<f64>();
 
 /// Capability bit indicating support for UTF-8 clipboard text packets.
 pub const CAPABILITY_CLIPBOARD_TEXT: u32 = 1 << 0;
@@ -20,6 +19,15 @@ pub const CAPABILITY_CLIPBOARD_TEXT: u32 = 1 << 0;
 /// Capability bit indicating support for the position-carrying
 /// [`ProtoEvent::EnterAt`] and [`ProtoEvent::LeaveAt`] events.
 pub const CAPABILITY_ENTER_POSITION: u32 = 1 << 1;
+
+/// Capability bit indicating support for generation-scoped control sessions
+/// via [`ProtoEvent::EnterSession`] and [`ProtoEvent::InputSession`].
+pub const CAPABILITY_CONTROL_SESSION: u32 = 1 << 2;
+
+/// Phase bit applied to a scoped session serial for Leave/Ack. Enter/Ack and
+/// InputSession use the low 31-bit session id, so delayed Enter acknowledgments
+/// cannot confirm a later Leave handshake.
+pub const CONTROL_SESSION_CLOSE_BIT: u32 = 1 << 31;
 
 /// Maximum UTF-8 clipboard payload accepted from a peer.
 pub const MAX_CLIPBOARD_TEXT_SIZE: usize = 16 * 1024;
@@ -48,6 +56,9 @@ pub enum ProtocolError {
     /// clipboard text is not valid UTF-8
     #[error("clipboard text is not valid UTF-8: {0}")]
     InvalidClipboardText(#[from] std::str::Utf8Error),
+    /// a scoped input packet wrapped a non-input event
+    #[error("scoped input contains a non-input event")]
+    InvalidSessionInput,
 }
 
 /// Position of a client
@@ -85,6 +96,9 @@ pub enum ProtoEvent {
     Ack(u32),
     /// Input event
     Input(InputEvent),
+    /// Input tied to a generation-scoped control session.
+    /// Only sent to peers advertising [`CAPABILITY_CONTROL_SESSION`].
+    InputSession { serial: u32, event: InputEvent },
     /// Ping event for tracking unresponsive clients.
     /// A client has to respond with [`ProtoEvent::Pong`].
     Ping,
@@ -113,6 +127,13 @@ pub enum ProtoEvent {
     /// sender's desktop bounding box.
     /// Only sent to peers advertising [`CAPABILITY_ENTER_POSITION`].
     LeaveAt { serial: u32, ratio: f64 },
+    /// Begin a generation-scoped control session at the given position.
+    /// Only sent to peers advertising [`CAPABILITY_CONTROL_SESSION`].
+    EnterSession {
+        pos: Position,
+        serial: u32,
+        ratio: f64,
+    },
 }
 
 impl Display for ProtoEvent {
@@ -122,6 +143,9 @@ impl Display for ProtoEvent {
             ProtoEvent::Leave(s) => write!(f, "Leave({s})"),
             ProtoEvent::Ack(s) => write!(f, "Ack({s})"),
             ProtoEvent::Input(e) => write!(f, "{e}"),
+            ProtoEvent::InputSession { serial, event } => {
+                write!(f, "InputSession({serial}, {event})")
+            }
             ProtoEvent::Ping => write!(f, "ping"),
             ProtoEvent::Pong(alive) => {
                 write!(
@@ -136,6 +160,9 @@ impl Display for ProtoEvent {
             }
             ProtoEvent::EnterAt { pos, ratio } => write!(f, "EnterAt({pos}, {ratio})"),
             ProtoEvent::LeaveAt { serial, ratio } => write!(f, "LeaveAt({serial}, {ratio})"),
+            ProtoEvent::EnterSession { pos, serial, ratio } => {
+                write!(f, "EnterSession({pos}, {serial}, {ratio})")
+            }
         }
     }
 }
@@ -157,23 +184,114 @@ pub enum EventType {
     Hello,
     EnterAt,
     LeaveAt,
+    EnterSession,
+    InputSession,
+}
+
+fn input_event_type(event: &InputEvent) -> EventType {
+    match event {
+        InputEvent::Pointer(pointer) => match pointer {
+            PointerEvent::Motion { .. } => EventType::PointerMotion,
+            PointerEvent::Button { .. } => EventType::PointerButton,
+            PointerEvent::Axis { .. } => EventType::PointerAxis,
+            PointerEvent::AxisDiscrete120 { .. } => EventType::PointerAxisValue120,
+        },
+        InputEvent::Keyboard(keyboard) => match keyboard {
+            KeyboardEvent::Key { .. } => EventType::KeyboardKey,
+            KeyboardEvent::Modifiers { .. } => EventType::KeyboardModifiers,
+        },
+    }
+}
+
+fn decode_input_event(event_type: EventType, buf: &mut &[u8]) -> Result<InputEvent, ProtocolError> {
+    match event_type {
+        EventType::PointerMotion => Ok(InputEvent::Pointer(PointerEvent::Motion {
+            time: decode_u32(buf)?,
+            dx: decode_f64(buf)?,
+            dy: decode_f64(buf)?,
+        })),
+        EventType::PointerButton => Ok(InputEvent::Pointer(PointerEvent::Button {
+            time: decode_u32(buf)?,
+            button: decode_u32(buf)?,
+            state: decode_u32(buf)?,
+        })),
+        EventType::PointerAxis => Ok(InputEvent::Pointer(PointerEvent::Axis {
+            time: decode_u32(buf)?,
+            axis: decode_u8(buf)?,
+            value: decode_f64(buf)?,
+        })),
+        EventType::PointerAxisValue120 => Ok(InputEvent::Pointer(PointerEvent::AxisDiscrete120 {
+            axis: decode_u8(buf)?,
+            value: decode_i32(buf)?,
+        })),
+        EventType::KeyboardKey => Ok(InputEvent::Keyboard(KeyboardEvent::Key {
+            time: decode_u32(buf)?,
+            key: decode_u32(buf)?,
+            state: decode_u8(buf)?,
+        })),
+        EventType::KeyboardModifiers => Ok(InputEvent::Keyboard(KeyboardEvent::Modifiers {
+            depressed: decode_u32(buf)?,
+            latched: decode_u32(buf)?,
+            locked: decode_u32(buf)?,
+            group: decode_u32(buf)?,
+        })),
+        _ => Err(ProtocolError::InvalidSessionInput),
+    }
+}
+
+fn encode_input_payload(event: InputEvent, buf: &mut &mut [u8], len: &mut usize) {
+    match event {
+        InputEvent::Pointer(pointer) => match pointer {
+            PointerEvent::Motion { time, dx, dy } => {
+                encode_u32(buf, len, time);
+                encode_f64(buf, len, dx);
+                encode_f64(buf, len, dy);
+            }
+            PointerEvent::Button {
+                time,
+                button,
+                state,
+            } => {
+                encode_u32(buf, len, time);
+                encode_u32(buf, len, button);
+                encode_u32(buf, len, state);
+            }
+            PointerEvent::Axis { time, axis, value } => {
+                encode_u32(buf, len, time);
+                encode_u8(buf, len, axis);
+                encode_f64(buf, len, value);
+            }
+            PointerEvent::AxisDiscrete120 { axis, value } => {
+                encode_u8(buf, len, axis);
+                encode_i32(buf, len, value);
+            }
+        },
+        InputEvent::Keyboard(keyboard) => match keyboard {
+            KeyboardEvent::Key { time, key, state } => {
+                encode_u32(buf, len, time);
+                encode_u32(buf, len, key);
+                encode_u8(buf, len, state);
+            }
+            KeyboardEvent::Modifiers {
+                depressed,
+                latched,
+                locked,
+                group,
+            } => {
+                encode_u32(buf, len, depressed);
+                encode_u32(buf, len, latched);
+                encode_u32(buf, len, locked);
+                encode_u32(buf, len, group);
+            }
+        },
+    }
 }
 
 impl ProtoEvent {
     fn event_type(&self) -> EventType {
         match self {
-            ProtoEvent::Input(e) => match e {
-                InputEvent::Pointer(p) => match p {
-                    PointerEvent::Motion { .. } => EventType::PointerMotion,
-                    PointerEvent::Button { .. } => EventType::PointerButton,
-                    PointerEvent::Axis { .. } => EventType::PointerAxis,
-                    PointerEvent::AxisDiscrete120 { .. } => EventType::PointerAxisValue120,
-                },
-                InputEvent::Keyboard(k) => match k {
-                    KeyboardEvent::Key { .. } => EventType::KeyboardKey,
-                    KeyboardEvent::Modifiers { .. } => EventType::KeyboardModifiers,
-                },
-            },
+            ProtoEvent::Input(event) => input_event_type(event),
+            ProtoEvent::InputSession { .. } => EventType::InputSession,
             ProtoEvent::Ping => EventType::Ping,
             ProtoEvent::Pong(_) => EventType::Pong,
             ProtoEvent::Enter(_) => EventType::Enter,
@@ -182,6 +300,7 @@ impl ProtoEvent {
             ProtoEvent::Hello { .. } => EventType::Hello,
             ProtoEvent::EnterAt { .. } => EventType::EnterAt,
             ProtoEvent::LeaveAt { .. } => EventType::LeaveAt,
+            ProtoEvent::EnterSession { .. } => EventType::EnterSession,
         }
     }
 }
@@ -193,44 +312,14 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
         let mut buf = &buf[..];
         let event_type = decode_u8(&mut buf)?;
         match EventType::try_from(event_type)? {
-            EventType::PointerMotion => {
-                Ok(Self::Input(InputEvent::Pointer(PointerEvent::Motion {
-                    time: decode_u32(&mut buf)?,
-                    dx: decode_f64(&mut buf)?,
-                    dy: decode_f64(&mut buf)?,
-                })))
+            event_type @ (EventType::PointerMotion
+            | EventType::PointerButton
+            | EventType::PointerAxis
+            | EventType::PointerAxisValue120
+            | EventType::KeyboardKey
+            | EventType::KeyboardModifiers) => {
+                Ok(Self::Input(decode_input_event(event_type, &mut buf)?))
             }
-            EventType::PointerButton => {
-                Ok(Self::Input(InputEvent::Pointer(PointerEvent::Button {
-                    time: decode_u32(&mut buf)?,
-                    button: decode_u32(&mut buf)?,
-                    state: decode_u32(&mut buf)?,
-                })))
-            }
-            EventType::PointerAxis => Ok(Self::Input(InputEvent::Pointer(PointerEvent::Axis {
-                time: decode_u32(&mut buf)?,
-                axis: decode_u8(&mut buf)?,
-                value: decode_f64(&mut buf)?,
-            }))),
-            EventType::PointerAxisValue120 => Ok(Self::Input(InputEvent::Pointer(
-                PointerEvent::AxisDiscrete120 {
-                    axis: decode_u8(&mut buf)?,
-                    value: decode_i32(&mut buf)?,
-                },
-            ))),
-            EventType::KeyboardKey => Ok(Self::Input(InputEvent::Keyboard(KeyboardEvent::Key {
-                time: decode_u32(&mut buf)?,
-                key: decode_u32(&mut buf)?,
-                state: decode_u8(&mut buf)?,
-            }))),
-            EventType::KeyboardModifiers => Ok(Self::Input(InputEvent::Keyboard(
-                KeyboardEvent::Modifiers {
-                    depressed: decode_u32(&mut buf)?,
-                    latched: decode_u32(&mut buf)?,
-                    locked: decode_u32(&mut buf)?,
-                    group: decode_u32(&mut buf)?,
-                },
-            ))),
             EventType::Ping => Ok(Self::Ping),
             EventType::Pong => Ok(Self::Pong(decode_u8(&mut buf)? != 0)),
             EventType::Enter => Ok(Self::Enter(decode_u8(&mut buf)?.try_into()?)),
@@ -255,6 +344,17 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 serial: decode_u32(&mut buf)?,
                 ratio: decode_f64(&mut buf)?,
             }),
+            EventType::EnterSession => Ok(Self::EnterSession {
+                pos: decode_u8(&mut buf)?.try_into()?,
+                serial: decode_u32(&mut buf)?,
+                ratio: decode_f64(&mut buf)?,
+            }),
+            EventType::InputSession => {
+                let serial = decode_u32(&mut buf)?;
+                let input_type = EventType::try_from(decode_u8(&mut buf)?)?;
+                let event = decode_input_event(input_type, &mut buf)?;
+                Ok(Self::InputSession { serial, event })
+            }
         }
     }
 }
@@ -269,51 +369,12 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
             let len = &mut len;
             encode_u8(buf, len, event.event_type() as u8);
             match event {
-                ProtoEvent::Input(event) => match event {
-                    InputEvent::Pointer(p) => match p {
-                        PointerEvent::Motion { time, dx, dy } => {
-                            encode_u32(buf, len, time);
-                            encode_f64(buf, len, dx);
-                            encode_f64(buf, len, dy);
-                        }
-                        PointerEvent::Button {
-                            time,
-                            button,
-                            state,
-                        } => {
-                            encode_u32(buf, len, time);
-                            encode_u32(buf, len, button);
-                            encode_u32(buf, len, state);
-                        }
-                        PointerEvent::Axis { time, axis, value } => {
-                            encode_u32(buf, len, time);
-                            encode_u8(buf, len, axis);
-                            encode_f64(buf, len, value);
-                        }
-                        PointerEvent::AxisDiscrete120 { axis, value } => {
-                            encode_u8(buf, len, axis);
-                            encode_i32(buf, len, value);
-                        }
-                    },
-                    InputEvent::Keyboard(k) => match k {
-                        KeyboardEvent::Key { time, key, state } => {
-                            encode_u32(buf, len, time);
-                            encode_u32(buf, len, key);
-                            encode_u8(buf, len, state);
-                        }
-                        KeyboardEvent::Modifiers {
-                            depressed,
-                            latched,
-                            locked,
-                            group,
-                        } => {
-                            encode_u32(buf, len, depressed);
-                            encode_u32(buf, len, latched);
-                            encode_u32(buf, len, locked);
-                            encode_u32(buf, len, group);
-                        }
-                    },
-                },
+                ProtoEvent::Input(event) => encode_input_payload(event, buf, len),
+                ProtoEvent::InputSession { serial, event } => {
+                    encode_u32(buf, len, serial);
+                    encode_u8(buf, len, input_event_type(&event) as u8);
+                    encode_input_payload(event, buf, len);
+                }
                 ProtoEvent::Ping => {}
                 ProtoEvent::Pong(alive) => encode_u8(buf, len, alive as u8),
                 ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
@@ -333,6 +394,11 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     encode_f64(buf, len, ratio);
                 }
                 ProtoEvent::LeaveAt { serial, ratio } => {
+                    encode_u32(buf, len, serial);
+                    encode_f64(buf, len, ratio);
+                }
+                ProtoEvent::EnterSession { pos, serial, ratio } => {
+                    encode_u8(buf, len, pos as u8);
                     encode_u32(buf, len, serial);
                     encode_f64(buf, len, ratio);
                 }
@@ -453,9 +519,10 @@ encode_impl!(f64);
 #[cfg(test)]
 mod tests {
     use super::{
-        CAPABILITY_CLIPBOARD_TEXT, CAPABILITY_ENTER_POSITION, EventType, MAX_CLIPBOARD_TEXT_SIZE,
-        MAX_EVENT_SIZE, MAX_WIRE_SIZE, Position, ProtoEvent, ProtocolError, WireEvent,
-        decode_wire_event, encode_clipboard_text,
+        CAPABILITY_CLIPBOARD_TEXT, CAPABILITY_CONTROL_SESSION, CAPABILITY_ENTER_POSITION,
+        CONTROL_SESSION_CLOSE_BIT, EventType, MAX_CLIPBOARD_TEXT_SIZE, MAX_EVENT_SIZE,
+        MAX_WIRE_SIZE, Position, ProtoEvent, ProtocolError, WireEvent, decode_wire_event,
+        encode_clipboard_text,
     };
     use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
 
@@ -639,6 +706,37 @@ mod tests {
                 0, // ratio = 0.5
             ]
         );
+        assert_eq!(
+            encode(ProtoEvent::EnterSession {
+                pos: Position::Top,
+                serial: 0x0102_0304,
+                ratio: 0.5,
+            }),
+            [
+                14, // EnterSession event id; append-only protocol contract
+                2,  // Position::Top
+                1, 2, 3, 4, // serial
+                0x3f, 0xe0, 0, 0, 0, 0, 0, 0, // ratio = 0.5
+            ]
+        );
+        assert_eq!(
+            encode(ProtoEvent::InputSession {
+                serial: 0x0102_0304,
+                event: InputEvent::Pointer(PointerEvent::Button {
+                    time: 5,
+                    button: 0x110,
+                    state: 1,
+                }),
+            }),
+            [
+                15, // InputSession event id
+                1, 2, 3, 4, // serial
+                1, // nested PointerButton event id
+                0, 0, 0, 5, // time
+                0, 0, 1, 0x10, // button
+                0, 0, 0, 1, // state
+            ]
+        );
 
         // clipboard packets use a reserved id outside the EventType range,
         // followed by a big-endian payload length
@@ -652,11 +750,38 @@ mod tests {
     /// buffers from them and reject anything larger.
     #[test]
     fn protocol_limits_are_frozen() {
-        assert_eq!(MAX_EVENT_SIZE, 21);
+        assert_eq!(MAX_EVENT_SIZE, 26);
         assert_eq!(MAX_CLIPBOARD_TEXT_SIZE, 16 * 1024);
         assert_eq!(MAX_WIRE_SIZE, 5 + 16 * 1024);
         assert_eq!(CAPABILITY_CLIPBOARD_TEXT, 1);
         assert_eq!(CAPABILITY_ENTER_POSITION, 2);
+        assert_eq!(CAPABILITY_CONTROL_SESSION, 4);
+        assert_eq!(CONTROL_SESSION_CLOSE_BIT, 1 << 31);
+    }
+
+    #[test]
+    fn event_type_ids_are_frozen() {
+        assert_eq!(
+            [
+                EventType::PointerMotion as u8,
+                EventType::PointerButton as u8,
+                EventType::PointerAxis as u8,
+                EventType::PointerAxisValue120 as u8,
+                EventType::KeyboardKey as u8,
+                EventType::KeyboardModifiers as u8,
+                EventType::Ping as u8,
+                EventType::Pong as u8,
+                EventType::Enter as u8,
+                EventType::Leave as u8,
+                EventType::Ack as u8,
+                EventType::Hello as u8,
+                EventType::EnterAt as u8,
+                EventType::LeaveAt as u8,
+                EventType::EnterSession as u8,
+                EventType::InputSession as u8,
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
     }
 
     #[test]
@@ -682,6 +807,19 @@ mod tests {
             ProtoEvent::LeaveAt {
                 serial: 0,
                 ratio: 0.25,
+            },
+            ProtoEvent::EnterSession {
+                pos: Position::Top,
+                serial: u32::MAX,
+                ratio: 0.125,
+            },
+            ProtoEvent::InputSession {
+                serial: 99,
+                event: InputEvent::Keyboard(KeyboardEvent::Key {
+                    time: 42,
+                    key: 103,
+                    state: 1,
+                }),
             },
             ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
                 time: 42,
@@ -725,6 +863,35 @@ mod tests {
             // ProtoEvent has no PartialEq; compare the canonical encoding
             assert_eq!(encode(decoded), encoded, "round trip changed {event:?}");
         }
+    }
+
+    #[test]
+    fn enter_session_display_includes_generation_and_position() {
+        assert_eq!(
+            ProtoEvent::EnterSession {
+                pos: Position::Bottom,
+                serial: 42,
+                ratio: 0.25,
+            }
+            .to_string(),
+            "EnterSession(bottom, 42, 0.25)"
+        );
+    }
+
+    #[test]
+    fn scoped_input_rejects_a_non_input_nested_event() {
+        let packet = [
+            EventType::InputSession as u8,
+            0,
+            0,
+            0,
+            7,
+            EventType::Ping as u8,
+        ];
+        assert!(matches!(
+            decode_wire_event(&packet),
+            Err(ProtocolError::InvalidSessionInput)
+        ));
     }
 
     #[test]

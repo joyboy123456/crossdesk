@@ -2604,6 +2604,8 @@ dependencies = [
  "libc",
  "log",
  "notify",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
  "rcgen",
  "rustls",
  "serde",
@@ -2646,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "lan-mouse-proto"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "input-event",
  "num_enum",

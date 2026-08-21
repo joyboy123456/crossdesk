@@ -22,7 +22,7 @@ input-emulation = { path = "input-emulation", version = "0.4.0", default-feature
 input-event = { path = "input-event", version = "0.4.0" }
 lan-mouse-cli = { path = "lan-mouse-cli", version = "0.4.0" }
 lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.4.0" }
-lan-mouse-proto = { path = "lan-mouse-proto", version = "0.4.0" }
+lan-mouse-proto = { path = "lan-mouse-proto", version = "0.4.1" }
 # third-party (shared by two or more crates)
 async-trait = "0.1.81"
 bitflags = "2.6.0"
@@ -125,6 +125,13 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSPasteboard",
+] }
 
 [features]
 default = [
