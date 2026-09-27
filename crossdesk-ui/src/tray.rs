@@ -6,7 +6,7 @@ pub enum TrayAction {
 
 #[cfg(any(windows, target_os = "macos"))]
 pub struct TrayController {
-    _tray: tray_icon::TrayIcon,
+    tray: tray_icon::TrayIcon,
     open_id: tray_icon::menu::MenuId,
     quit_id: tray_icon::menu::MenuId,
 }
@@ -35,10 +35,18 @@ impl TrayController {
             .build()?;
 
         Ok(Self {
-            _tray: tray,
+            tray,
             open_id: open.id().clone(),
             quit_id: quit.id().clone(),
         })
+    }
+
+    /// Show the current session in the tray tooltip, so it can be read
+    /// while the window is hidden.
+    pub fn set_status(&self, text: &str) {
+        if let Err(error) = self.tray.set_tooltip(Some(text)) {
+            log::debug!("failed to update tray tooltip: {error}");
+        }
     }
 
     pub fn poll(&self) -> Option<TrayAction> {
@@ -61,6 +69,8 @@ impl TrayController {
     pub fn new() -> Result<Self, std::convert::Infallible> {
         Ok(Self)
     }
+
+    pub fn set_status(&self, _text: &str) {}
 
     pub fn poll(&self) -> Option<TrayAction> {
         None

@@ -4,15 +4,15 @@ use std::time::{Duration, Instant};
 
 use async_channel::Receiver;
 use eframe::egui::{
-    self, Align, Align2, Button, Color32, CornerRadius, Frame, Id, Layout, RichText, Sense, Stroke,
-    Vec2,
+    self, Align, Align2, Button, Color32, CornerRadius, Frame, Id, Layout, Pos2, RichText, Sense,
+    Stroke, Vec2,
 };
 
 use lan_mouse_ipc::{ClientHandle, FrontendRequest, Position};
 
 use crate::app::CrossDeskApp;
 use crate::app::geometry::position_occupied;
-use crate::app::widgets::{icon, icon_glyph};
+use crate::app::widgets::{danger_button, icon_glyph, icon_tile, primary_button, secondary_button};
 use crate::model::{DeviceDraft, position_label};
 use crate::scan::{FoundDevice, ScanEvent};
 use crate::theme;
@@ -117,26 +117,49 @@ impl CrossDeskApp {
             "添加设备"
         };
         let mut action = None;
+        backdrop(ctx, "device-editor", fade);
         egui::Area::new(Id::new("device-editor"))
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.multiply_opacity(fade);
                 dialog_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(420.0);
-                    ui.label(theme::heading_text(title));
+                    let palette = theme::palette(ui);
+                    ui.set_width(440.0);
+                    dialog_header(
+                        ui,
+                        if editor.handle.is_some() {
+                            "pencil"
+                        } else {
+                            "monitor-smartphone"
+                        },
+                        title,
+                        "填写对方设备的地址，并选择它在本机屏幕的哪一侧",
+                    );
+                    ui.add_space(14.0);
+                    let hostname_label = ui.label(field_label("主机名", palette));
+                    ui.add(field_edit(
+                        &mut editor.draft.hostname,
+                        "例如 mac-mini.local",
+                    ))
+                    .labelled_by(hostname_label.id);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let width = ui.available_width();
+                        ui.vertical(|ui| {
+                            ui.set_width(width - 132.0);
+                            let ips_label = ui.label(field_label("IP 地址", palette));
+                            ui.add(field_edit(&mut editor.draft.ips, "可选，多个用逗号分隔"))
+                                .labelled_by(ips_label.id);
+                        });
+                        ui.vertical(|ui| {
+                            let port_label = ui.label(field_label("端口", palette));
+                            ui.add(field_edit(&mut editor.draft.port, "4242").desired_width(120.0))
+                                .labelled_by(port_label.id);
+                        });
+                    });
                     ui.add_space(8.0);
-                    let hostname_label = ui.label("主机名");
-                    ui.text_edit_singleline(&mut editor.draft.hostname)
-                        .labelled_by(hostname_label.id);
-                    let ips_label = ui.label("IP 地址");
-                    ui.text_edit_singleline(&mut editor.draft.ips)
-                        .labelled_by(ips_label.id);
-                    let port_label = ui.label("端口");
-                    ui.add(egui::TextEdit::singleline(&mut editor.draft.port).desired_width(120.0))
-                        .labelled_by(port_label.id);
-                    ui.add_space(6.0);
-                    ui.label("屏幕方向");
+                    ui.label(field_label("屏幕方向", palette));
                     ui.horizontal(|ui| {
                         for pos in [
                             Position::Left,
@@ -154,24 +177,28 @@ impl CrossDeskApp {
                             if ui
                                 .add_enabled(
                                     !occupied || selected,
-                                    Button::new(position_label(pos)).selected(selected),
+                                    Button::new(position_label(pos))
+                                        .selected(selected)
+                                        .min_size(Vec2::new(64.0, 32.0)),
                                 )
+                                .on_disabled_hover_text("该方向已有启用设备")
                                 .clicked()
                             {
                                 editor.draft.pos = pos;
                             }
                         }
                     });
+                    ui.add_space(4.0);
                     ui.checkbox(&mut editor.draft.active, "立即启用");
                     if let Some(error) = &editor.error {
-                        ui.colored_label(theme::palette(ui).danger, error);
+                        ui.colored_label(palette.danger, error);
                     }
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("保存").clicked() {
+                        if primary_button(ui, Some("check"), "保存").clicked() {
                             action = Some(true);
                         }
-                        if ui.button("取消").clicked() {
+                        if secondary_button(ui, "取消").clicked() {
                             action = Some(false);
                         }
                     });
@@ -315,6 +342,7 @@ impl CrossDeskApp {
         let error = scan.error.clone();
         let devices = scan.devices.clone();
         let mut action = None;
+        backdrop(ctx, "device-scan", fade);
         egui::Area::new(Id::new("device-scan"))
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .order(egui::Order::Foreground)
@@ -322,15 +350,14 @@ impl CrossDeskApp {
                 ui.multiply_opacity(fade);
                 dialog_frame(ui).show(ui, |ui| {
                     let palette = theme::palette(ui);
-                    ui.set_min_width(420.0);
-                    ui.label(theme::heading_text("添加设备"));
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("自动扫描局域网中运行 CrossDesk 的设备")
-                            .size(theme::BODY_SIZE)
-                            .color(palette.text_secondary),
+                    ui.set_width(460.0);
+                    dialog_header(
+                        ui,
+                        "radar",
+                        "添加设备",
+                        "自动扫描局域网中运行 CrossDesk 的设备",
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(12.0);
 
                     // Fixed-height results region: the dialog must not jump
                     // around while the spinner and arriving results change
@@ -384,17 +411,25 @@ impl CrossDeskApp {
                         },
                     );
 
-                    ui.add_space(10.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("取消").clicked() {
-                            action = Some(Action::Cancel);
-                        }
-                        if ui.button("手动添加").clicked() {
-                            action = Some(Action::Manual);
-                        }
-                        if ui.add_enabled(!scanning, Button::new("重新扫描")).clicked() {
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !scanning,
+                                Button::new("重新扫描").min_size(Vec2::new(0.0, 32.0)),
+                            )
+                            .clicked()
+                        {
                             action = Some(Action::Rescan);
                         }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if secondary_button(ui, "取消").clicked() {
+                                action = Some(Action::Cancel);
+                            }
+                            if secondary_button(ui, "手动添加").clicked() {
+                                action = Some(Action::Manual);
+                            }
+                        });
                     });
                 });
             });
@@ -435,28 +470,42 @@ impl CrossDeskApp {
     fn scan_device_row(&self, ui: &mut egui::Ui, device: &FoundDevice) -> bool {
         let palette = theme::palette(ui);
         let mut picked = false;
-        theme::card_frame(ui).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(icon("monitor", 18.0, palette.accent));
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(device.display_name()).strong());
-                    ui.label(
-                        RichText::new(format!("{}:{}", device.addr, device.port))
-                            .size(theme::CAPTION_SIZE)
-                            .color(palette.text_secondary),
-                    );
+        theme::full_card(
+            ui,
+            theme::card_frame(ui)
+                .fill(palette.bg_canvas)
+                .inner_margin(egui::Margin::symmetric(12, 10)),
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    icon_tile(ui, "monitor", 34.0, palette.accent, false);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(
+                            RichText::new(device.display_name())
+                                .strong()
+                                .color(palette.text),
+                        );
+                        ui.label(
+                            theme::mono_text(
+                                format!("{}:{}", device.addr, device.port),
+                                theme::CAPTION_SIZE + 0.5,
+                            )
+                            .color(palette.text_muted),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if self.is_local_device(device) {
+                            ui.label(RichText::new("本机").color(palette.text_muted));
+                        } else if self.device_known(device) {
+                            ui.label(RichText::new("已添加").color(palette.text_muted));
+                        } else if primary_button(ui, Some("plus"), "添加").clicked() {
+                            picked = true;
+                        }
+                    });
                 });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if self.is_local_device(device) {
-                        ui.label(RichText::new("本机").color(palette.text_muted));
-                    } else if self.device_known(device) {
-                        ui.label(RichText::new("已添加").color(palette.text_muted));
-                    } else if ui.button("添加").clicked() {
-                        picked = true;
-                    }
-                });
-            });
-        });
+            },
+        );
         picked
     }
 
@@ -474,25 +523,41 @@ impl CrossDeskApp {
         let Some(handle) = self.delete_confirmation else {
             return;
         };
+        let name = self
+            .state
+            .clients
+            .get(&handle)
+            .and_then(|client| client.config.hostname.clone())
+            .unwrap_or_else(|| "该设备".to_owned());
         let mut action = None;
+        backdrop(ctx, "delete-device", fade);
         egui::Area::new(Id::new("delete-device"))
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.multiply_opacity(fade);
                 dialog_frame(ui).show(ui, |ui| {
-                    ui.label(theme::heading_text("删除设备"));
-                    ui.add_space(8.0);
-                    ui.label("删除后需要重新添加并配置该设备。");
-                    ui.add_space(10.0);
+                    let palette = theme::palette(ui);
+                    ui.set_width(380.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        icon_tile(ui, "trash-2", 40.0, palette.danger, false);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            ui.label(theme::heading_text("删除设备").color(palette.text));
+                            ui.label(
+                                RichText::new(format!("删除 {name} 后，需要重新添加并配置它。"))
+                                    .size(theme::BODY_SIZE)
+                                    .color(palette.text_secondary),
+                            );
+                        });
+                    });
+                    ui.add_space(16.0);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(Button::new("删除").fill(theme::palette(ui).danger))
-                            .clicked()
-                        {
+                        if danger_button(ui, Some("trash-2"), "删除").clicked() {
                             action = Some(true);
                         }
-                        if ui.button("取消").clicked() {
+                        if secondary_button(ui, "取消").clicked() {
                             action = Some(false);
                         }
                     });
@@ -541,13 +606,18 @@ impl CrossDeskApp {
                 Frame::new()
                     .fill(palette.surface_raised)
                     .stroke(Stroke::new(1.0, bar_color.gamma_multiply(0.35)))
-                    .corner_radius(CornerRadius::same(12))
-                    .inner_margin(egui::Margin::symmetric(16, 11))
+                    .corner_radius(CornerRadius::same(255))
+                    .inner_margin(egui::Margin {
+                        left: 6,
+                        right: 16,
+                        top: 6,
+                        bottom: 6,
+                    })
                     .shadow(egui::Shadow {
-                        offset: [0, 6],
-                        blur: 24,
+                        offset: [0, 8],
+                        blur: 28,
                         spread: 0,
-                        color: Color32::from_black_alpha(70),
+                        color: Color32::from_black_alpha(80),
                     })
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -557,7 +627,21 @@ impl CrossDeskApp {
                             } else {
                                 "check"
                             };
-                            ui.label(icon(icon_name, 15.0, bar_color));
+                            let (dot, _) =
+                                ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+                            ui.painter().circle_filled(
+                                dot.center(),
+                                12.0,
+                                bar_color.gamma_multiply(0.16),
+                            );
+                            let (glyph, family) = icon_glyph(icon_name);
+                            ui.painter().text(
+                                dot.center(),
+                                Align2::CENTER_CENTER,
+                                glyph.to_string(),
+                                theme::icon_font(&family, 13.0),
+                                bar_color,
+                            );
                             ui.label(
                                 RichText::new(&notice.text)
                                     .size(theme::BODY_SIZE)
@@ -657,14 +741,62 @@ fn scan_status(ui: &mut egui::Ui, scanning: bool, error: Option<&str>) {
 pub(crate) fn dialog_frame(ui: &egui::Ui) -> Frame {
     let palette = theme::palette(ui);
     Frame::new()
-        .fill(palette.surface_raised)
-        .stroke(Stroke::new(1.0, palette.border))
-        .corner_radius(CornerRadius::same(16))
+        .fill(palette.surface)
+        .stroke(Stroke::new(1.0, palette.border_strong))
+        .corner_radius(CornerRadius::same(18))
         .inner_margin(24)
         .shadow(egui::Shadow {
-            offset: [0, 12],
-            blur: 40,
+            offset: [0, 18],
+            blur: 56,
             spread: 0,
-            color: Color32::from_black_alpha(80),
+            color: Color32::from_black_alpha(110),
         })
+}
+
+/// Dim the window behind a dialog and swallow clicks meant for it.
+fn backdrop(ctx: &egui::Context, id: &str, fade: f32) {
+    let rect = ctx.content_rect();
+    egui::Area::new(Id::new((id, "backdrop")))
+        .order(egui::Order::Middle)
+        .fixed_pos(Pos2::ZERO)
+        .interactable(true)
+        .show(ctx, |ui| {
+            ui.allocate_rect(rect, Sense::click());
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::ZERO,
+                Color32::from_black_alpha((120.0 * fade) as u8),
+            );
+        });
+}
+
+/// Icon tile, title and one line of explanation at the top of a dialog.
+fn dialog_header(ui: &mut egui::Ui, icon_name: &str, title: &str, subtitle: &str) {
+    let palette = theme::palette(ui);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        icon_tile(ui, icon_name, 40.0, palette.accent, true);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.label(theme::heading_text(title).color(palette.text));
+            ui.label(
+                RichText::new(subtitle)
+                    .size(theme::CAPTION_SIZE + 1.0)
+                    .color(palette.text_muted),
+            );
+        });
+    });
+}
+
+fn field_label(text: &str, palette: theme::Palette) -> RichText {
+    RichText::new(text)
+        .size(theme::CAPTION_SIZE + 1.0)
+        .color(palette.text_secondary)
+}
+
+fn field_edit<'a>(text: &'a mut String, hint: &'a str) -> egui::TextEdit<'a> {
+    egui::TextEdit::singleline(text)
+        .hint_text(hint)
+        .margin(egui::Margin::symmetric(10, 7))
+        .desired_width(f32::INFINITY)
 }

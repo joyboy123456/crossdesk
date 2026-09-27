@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
 };
 
 use lan_mouse_ipc::{
@@ -13,6 +13,42 @@ pub struct UiClient {
     pub handle: ClientHandle,
     pub config: ClientConfig,
     pub state: ClientState,
+}
+
+/// Who drives whom right now, resolved against the device list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Session {
+    /// every machine uses its own mouse and keyboard
+    Idle,
+    /// a session is being handed over or torn down
+    Switching,
+    /// this machine's mouse and keyboard drive `handle`
+    Outgoing { handle: ClientHandle, peer: String },
+    /// `peer` drives this machine; `handle` is set when the peer is also a
+    /// configured device
+    Incoming {
+        handle: Option<ClientHandle>,
+        peer: String,
+        addr: SocketAddr,
+        /// the name came from the authorization list, not the raw address
+        known: bool,
+    },
+}
+
+impl Session {
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Outgoing { .. } | Self::Incoming { .. })
+    }
+
+    /// One line for the tray tooltip and the window title.
+    pub fn summary(&self) -> Option<String> {
+        match self {
+            Self::Outgoing { peer, .. } => Some(format!("正在控制 {peer}")),
+            Self::Incoming { peer, .. } => Some(format!("正在被 {peer} 控制")),
+            Self::Switching => Some("正在切换".to_owned()),
+            Self::Idle => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -97,6 +133,50 @@ impl UiState {
         self.clients.values().any(|client| {
             client.state.active && client.config.pos == pos && Some(client.handle) != except
         })
+    }
+
+    /// The configured device reachable at `ip`, if any.
+    pub fn client_at(&self, ip: IpAddr) -> Option<ClientHandle> {
+        self.clients.values().find_map(|client| {
+            let matches = client.state.active_addr.is_some_and(|addr| addr.ip() == ip)
+                || client.config.fix_ips.contains(&ip)
+                || client.state.ips.contains(&ip)
+                || client.state.dns_ips.contains(&ip);
+            matches.then_some(client.handle)
+        })
+    }
+
+    pub fn session(&self) -> Session {
+        match &self.control_state {
+            ControlState::Idle | ControlState::ReadyToReceive => Session::Idle,
+            ControlState::Switching => Session::Switching,
+            ControlState::Controlling { handle } => Session::Outgoing {
+                handle: *handle,
+                peer: self
+                    .clients
+                    .get(handle)
+                    .and_then(|client| client.config.hostname.clone())
+                    .unwrap_or_else(|| format!("设备 #{handle}")),
+            },
+            ControlState::ControlledBy { addr, fingerprint } => {
+                let handle = self.client_at(addr.ip());
+                let authorized = self.authorized.get(fingerprint).cloned();
+                let known = authorized.is_some();
+                let peer = authorized
+                    .or_else(|| {
+                        handle
+                            .and_then(|handle| self.clients.get(&handle))
+                            .and_then(|client| client.config.hostname.clone())
+                    })
+                    .unwrap_or_else(|| addr.to_string());
+                Session::Incoming {
+                    handle,
+                    peer,
+                    addr: *addr,
+                    known,
+                }
+            }
+        }
     }
 
     pub fn next_screen_number(&self, handle: ClientHandle) -> usize {
@@ -378,6 +458,84 @@ mod tests {
                 addr,
                 fingerprint: "aa:bb".into(),
             }
+        );
+    }
+
+    fn client(handle: ClientHandle, name: &str, ip: &str) -> FrontendEvent {
+        FrontendEvent::Created(
+            handle,
+            ClientConfig {
+                hostname: Some(name.into()),
+                fix_ips: vec![ip.parse().expect("valid ip")],
+                ..Default::default()
+            },
+            ClientState {
+                active: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn session_names_both_directions() {
+        let mut state = UiState::new();
+        state.apply(client(1, "Mac-mini-M4", "192.168.0.101"));
+        assert_eq!(state.session(), Session::Idle);
+
+        state.apply(FrontendEvent::ControlState(ControlState::Controlling {
+            handle: 1,
+        }));
+        assert_eq!(
+            state.session(),
+            Session::Outgoing {
+                handle: 1,
+                peer: "Mac-mini-M4".into()
+            }
+        );
+
+        let addr = "192.168.0.101:4242".parse().expect("valid address");
+        state.apply(FrontendEvent::ControlState(ControlState::ControlledBy {
+            addr,
+            fingerprint: "aa:bb".into(),
+        }));
+        // an unauthorized-but-configured peer is recognized by its address
+        assert_eq!(
+            state.session(),
+            Session::Incoming {
+                handle: Some(1),
+                peer: "Mac-mini-M4".into(),
+                addr,
+                known: false,
+            }
+        );
+
+        state.authorized.insert("aa:bb".into(), "Mac 工作机".into());
+        let Session::Incoming { peer, known, .. } = state.session() else {
+            panic!("still incoming");
+        };
+        assert_eq!((peer.as_str(), known), ("Mac 工作机", true));
+    }
+
+    #[test]
+    fn unknown_incoming_peer_falls_back_to_its_address() {
+        let mut state = UiState::new();
+        let addr = "10.0.0.9:4242".parse().expect("valid address");
+        state.apply(FrontendEvent::ControlState(ControlState::ControlledBy {
+            addr,
+            fingerprint: "cc:dd".into(),
+        }));
+        assert_eq!(
+            state.session(),
+            Session::Incoming {
+                handle: None,
+                peer: "10.0.0.9:4242".into(),
+                addr,
+                known: false,
+            }
+        );
+        assert_eq!(
+            state.session().summary().as_deref(),
+            Some("正在被 10.0.0.9:4242 控制")
         );
     }
 

@@ -11,7 +11,7 @@ use lan_mouse_ipc::{ClientHandle, Position};
 use crate::app::dialogs::PendingPosition;
 use crate::model::UiState;
 
-pub(crate) const SCREEN_LAYOUT_DESIGN_WIDTH: f32 = 574.0;
+pub(crate) const SCREEN_LAYOUT_DESIGN_WIDTH: f32 = 610.0;
 pub(crate) const SLOT_DROP_TOLERANCE: f32 = 12.0;
 
 pub(crate) fn screen_layout_geometry(canvas: Rect) -> (Rect, [(Position, Rect); 4]) {

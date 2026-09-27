@@ -178,7 +178,48 @@ fn controlling_device_row_replaces_online_status() {
     harness.step();
 
     harness.get_by_label("正在控制 Mac-mini-M4");
-    harness.get_by_label("正在控制");
+    harness.get_by_label("受本机控制");
+    assert!(harness.query_by_label("在线").is_none());
+}
+
+#[test]
+fn incoming_session_marks_the_controlling_device_and_the_window_title() {
+    let mut harness = app_harness();
+    add_active_screen(harness.state_mut(), 4, Position::Left, "Surface", true);
+    let addr: std::net::SocketAddr = "192.168.0.102:4242".parse().expect("valid address");
+    if let Some(client) = harness.state_mut().state.clients.get_mut(&4) {
+        client.state.active_addr = Some(addr);
+    }
+    harness.state_mut().state.control_state = ControlState::ControlledBy {
+        addr,
+        fingerprint: "ee:ff".into(),
+    };
+    harness.run_steps(2);
+
+    // the peer is recognized by its address although it is not authorized
+    harness.get_by_label("正在被 Surface 控制");
+    harness.get_by_label("正在控制本机");
+    assert!(harness.query_by_label("在线").is_none());
+    let (session, _) = harness
+        .state()
+        .session_since
+        .clone()
+        .expect("session is tracked");
+    assert_eq!(session.summary().as_deref(), Some("正在被 Surface 控制"));
+}
+
+#[test]
+fn live_session_board_follows_to_other_pages() {
+    let mut harness = app_harness();
+    harness.state_mut().page = Page::Settings;
+    harness.step();
+    assert!(harness.query_by_label("已启用，等待鼠标滑入").is_none());
+
+    add_active_screen(harness.state_mut(), 3, Position::Right, "Mac-mini-M4", true);
+    harness.state_mut().state.control_state = ControlState::Controlling { handle: 3 };
+    harness.step();
+    harness.get_by_label("正在控制 Mac-mini-M4");
+    harness.get_by_role_and_label(Role::Button, "立即断开");
 }
 
 #[test]
@@ -378,7 +419,8 @@ fn long_pages_scroll_at_the_minimum_window_size() {
 
     let last = harness.get_by_label("设备 19");
     assert!(last.rect().max.y > 560.0);
-    for _ in 0..12 {
+    // 100px per action; overshooting is fine, the scroll area clamps
+    for _ in 0..30 {
         last.scroll_down();
     }
     harness.run_steps(2);
@@ -682,4 +724,123 @@ fn disconnect_and_timeout_roll_back_pending_directions() {
     app.drain_bridge();
     assert!(app.pending_positions.is_empty());
     assert_eq!(app.bridge.try_test_request(), Some(FrontendRequest::Sync));
+}
+
+/// Renders every page to `target/ui-preview/*.png` for visual review.
+/// Run with `cargo test -p crossdesk-ui ui_preview -- --ignored`.
+#[test]
+#[ignore = "writes preview images; needs a wgpu adapter"]
+fn ui_preview() {
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/ui-preview");
+    std::fs::create_dir_all(&out).expect("preview dir");
+    for (theme, suffix) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
+        for (page, name) in [
+            (Page::Devices, "devices"),
+            (Page::Authorization, "authorization"),
+            (Page::Settings, "settings"),
+        ] {
+            let mut harness = Harness::builder()
+                .with_size(Vec2::new(1040.0, 720.0))
+                .with_theme(theme)
+                .build_eframe(|cc| CrossDeskApp::for_test(cc));
+            let app = harness.state_mut();
+            app.page = page;
+            add_active_screen(app, 1, Position::Right, "Mac-mini-M4", true);
+            add_active_screen(app, 2, Position::Left, "Surface-Laptop", false);
+            app.state
+                .authorized
+                .insert("aa:bb:cc:dd:ee:ff:00:11:22:33".into(), "Mac-mini-M4".into());
+            app.state
+                .authorized
+                .insert("12:34:56:78:9a:bc:de:f0".into(), "Surface-Laptop".into());
+            app.state.control_state = ControlState::Controlling { handle: 1 };
+            harness.run_steps(8);
+            let image = harness.render().expect("render");
+            image
+                .save(out.join(format!("{name}-{suffix}.png")))
+                .expect("save png");
+
+            if page == Page::Devices {
+                let addr: std::net::SocketAddr =
+                    "192.168.0.102:4242".parse().expect("valid address");
+                let app = harness.state_mut();
+                if let Some(client) = app.state.clients.get_mut(&2) {
+                    client.state.active_addr = Some(addr);
+                    client.state.alive = true;
+                }
+                app.state.control_state = ControlState::ControlledBy {
+                    addr,
+                    fingerprint: "12:34:56:78:9a:bc:de:f0".into(),
+                };
+                harness.run_steps(8);
+                harness
+                    .render()
+                    .expect("render")
+                    .save(out.join(format!("{name}-incoming-{suffix}.png")))
+                    .expect("save png");
+            }
+        }
+    }
+}
+
+/// Dialogs, the empty state and the minimum window size, for visual review.
+/// Run with `cargo test -p crossdesk-ui ui_preview -- --ignored`.
+#[test]
+#[ignore = "writes preview images; needs a wgpu adapter"]
+fn ui_preview_states() {
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/ui-preview");
+    std::fs::create_dir_all(&out).expect("preview dir");
+    let save = |harness: &mut Harness<'static, CrossDeskApp>, name: &str| {
+        harness.run_steps(8);
+        harness
+            .render()
+            .expect("render")
+            .save(out.join(format!("{name}.png")))
+            .expect("save png");
+    };
+    for (theme, suffix) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
+        let build = |size: Vec2| {
+            Harness::builder()
+                .with_size(size)
+                .with_theme(theme)
+                .build_eframe(|cc| CrossDeskApp::for_test(cc))
+        };
+
+        let mut harness = build(Vec2::new(760.0, 560.0));
+        save(&mut harness, &format!("empty-min-{suffix}"));
+
+        let mut harness = build(Vec2::new(1040.0, 720.0));
+        let ctx = harness.ctx.clone();
+        harness.state_mut().open_scanner(&ctx);
+        harness.step();
+        let scan = harness.state().scan.as_ref().expect("scan dialog is open");
+        for (name, addr) in [("mac-mini", "192.168.0.101"), ("XinMan", "192.168.0.102")] {
+            scan.inject(crate::scan::ScanEvent::Found(crate::scan::FoundDevice {
+                hostname: name.into(),
+                addr: addr.parse().expect("valid address"),
+                port: lan_mouse_ipc::DEFAULT_PORT,
+            }));
+        }
+        harness.state_mut().local_hostname = "XinMan".into();
+        save(&mut harness, &format!("scan-{suffix}"));
+
+        let mut harness = build(Vec2::new(1040.0, 720.0));
+        add_active_screen(harness.state_mut(), 1, Position::Right, "Mac-mini-M4", true);
+        harness.state_mut().editor = Some(Editor {
+            handle: None,
+            draft: crate::model::DeviceDraft {
+                hostname: "mac-mini.local".into(),
+                ips: "192.168.0.101".into(),
+                port: "4242".into(),
+                ..Default::default()
+            },
+            error: None,
+        });
+        save(&mut harness, &format!("editor-{suffix}"));
+
+        let mut harness = build(Vec2::new(1040.0, 720.0));
+        add_active_screen(harness.state_mut(), 1, Position::Right, "Mac-mini-M4", true);
+        harness.state_mut().delete_confirmation = Some(1);
+        save(&mut harness, &format!("delete-{suffix}"));
+    }
 }
