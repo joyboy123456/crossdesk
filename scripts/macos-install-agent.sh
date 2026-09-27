@@ -7,14 +7,18 @@ $0: Install CrossDesk.app as a per-user LaunchAgent.
 
 The daemon has to run inside the graphical login session: TCC only grants
 Accessibility and Input Monitoring there, and a plain SSH session is not part
-of it. A LaunchAgent in ~/Library/LaunchAgents is the way to get that - and
-unlike a plist under /tmp it survives a reboot.
+of it. A LaunchAgent in ~/Library/LaunchAgents is the way to get that.
+
+The agent is started once now. It does not start at login unless --autostart
+is given, and launchd never restarts it after it exits or crashes: a daemon
+that holds a system-wide event tap must stay killable by a reboot.
 
 usage: $0 [options]
 
 OPTIONS
     --app PATH      bundle to run (default: ./target/CrossDesk.app)
     --label NAME    launchd label (default: $LABEL_DEFAULT)
+    --autostart     also start the agent at every login
     --uninstall     remove the agent instead of installing it
     -h, --help      show this help
 
@@ -26,11 +30,13 @@ LABEL_DEFAULT="app.crossdesk.daemon"
 LABEL="$LABEL_DEFAULT"
 APP="./target/CrossDesk.app"
 UNINSTALL=0
+AUTOSTART=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --app) APP="$2"; shift 2 ;;
         --label) LABEL="$2"; shift 2 ;;
+        --autostart) AUTOSTART=true; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -70,12 +76,9 @@ cat > "$plist" <<PLIST
 		<string>daemon</string>
 	</array>
 	<key>RunAtLoad</key>
-	<true/>
+	<$AUTOSTART/>
 	<key>KeepAlive</key>
-	<dict>
-		<key>SuccessfulExit</key>
-		<false/>
-	</dict>
+	<false/>
 	<key>ProcessType</key>
 	<string>Interactive</string>
 	<key>EnvironmentVariables</key>
@@ -94,8 +97,9 @@ PLIST
 launchctl bootout "$domain/$LABEL" 2>/dev/null || true
 launchctl bootstrap "$domain" "$plist"
 launchctl enable "$domain/$LABEL"
+[ "$AUTOSTART" = true ] || launchctl kickstart "$domain/$LABEL"
 
-echo "installed $plist"
+echo "installed $plist (start at login: $AUTOSTART)"
 echo "logs: /tmp/$LABEL.stderr.log"
 echo
 echo "On first run macOS asks for Accessibility and Input Monitoring."

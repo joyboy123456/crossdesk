@@ -28,7 +28,7 @@ use keycode::{KeyMap, KeyMapping};
 use libc::c_void;
 use once_cell::unsync::Lazy;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     ffi::{CString, c_char},
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -38,11 +38,95 @@ use std::{
 };
 use tokio::sync::{
     Mutex,
-    mpsc::{self, Receiver, Sender},
+    mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender, error::TrySendError},
     oneshot,
 };
 
 const CROSSDESK_ENTER_EVENT_TAG: i64 = 0x4352_4f53_5344_534b;
+
+// The event tap sits in front of *every* local mouse and keyboard event of the
+// login session. Whatever goes wrong behind it, the callback must neither
+// block nor keep dropping events, or the whole machine loses its input. The
+// limits below exist so that failures degrade to "CrossDesk stops capturing"
+// instead of "the Mac is frozen".
+
+/// capacity of the tap -> service queue. The callback never waits on it: a
+/// full queue means the consumer stalled, and the capture is dropped.
+const EVENT_CHANNEL_CAPACITY: usize = 256;
+/// capacity of the tap -> producer-task queue (Grab, display changes, ...)
+const NOTIFY_CHANNEL_CAPACITY: usize = 32;
+/// more capture starts than this within [`CAPTURE_STORM_WINDOW`] is a
+/// feedback loop (e.g. emulated motion re-crossing a barrier), not a user
+const CAPTURE_STORM_LIMIT: usize = 8;
+const CAPTURE_STORM_WINDOW: Duration = Duration::from_secs(2);
+/// how long no new capture may start after a storm or a forced release
+const CAPTURE_COOLDOWN: Duration = Duration::from_secs(3);
+/// more `TapDisabledByTimeout` than this within [`TAP_TIMEOUT_WINDOW`] and
+/// the tap is left disabled instead of being re-enabled over and over
+const TAP_TIMEOUT_LIMIT: usize = 3;
+const TAP_TIMEOUT_WINDOW: Duration = Duration::from_secs(30);
+
+/// Occurrences inside a sliding time window.
+#[derive(Debug, Default)]
+struct SlidingWindow {
+    hits: VecDeque<Instant>,
+}
+
+impl SlidingWindow {
+    /// records a hit at `now`; returns how many hits fall inside `window`
+    fn hit(&mut self, now: Instant, window: Duration) -> usize {
+        while self
+            .hits
+            .front()
+            .is_some_and(|&t| now.saturating_duration_since(t) > window)
+        {
+            self.hits.pop_front();
+        }
+        self.hits.push_back(now);
+        self.hits.len()
+    }
+
+    fn clear(&mut self) {
+        self.hits.clear();
+    }
+}
+
+/// Decides whether a barrier crossing may start a capture.
+#[derive(Debug, Default)]
+struct CaptureGate {
+    blocked_until: Option<Instant>,
+    starts: SlidingWindow,
+}
+
+impl CaptureGate {
+    fn try_start(&mut self, now: Instant) -> bool {
+        if self.blocked_until.is_some_and(|until| now < until) {
+            return false;
+        }
+        self.blocked_until = None;
+        if self.starts.hit(now, CAPTURE_STORM_WINDOW) > CAPTURE_STORM_LIMIT {
+            log::warn!(
+                "capture storm: more than {CAPTURE_STORM_LIMIT} captures within \
+                 {CAPTURE_STORM_WINDOW:?}, pausing new captures for {CAPTURE_COOLDOWN:?}"
+            );
+            self.starts.clear();
+            self.block(now);
+            return false;
+        }
+        true
+    }
+
+    fn block(&mut self, now: Instant) {
+        self.blocked_until = Some(now + CAPTURE_COOLDOWN);
+    }
+}
+
+/// Ctrl+Option+Shift+Command, the default release bind. Also handled inside
+/// the tap itself so it releases local input even when the service is hung.
+fn is_emergency_release_chord(flags: CGEventFlags) -> bool {
+    let all = XMods::ShiftMask | XMods::ControlMask | XMods::Mod1Mask | XMods::Mod4Mask;
+    modifier_masks(flags).0.contains(all)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SyntheticEnterAction {
@@ -173,6 +257,13 @@ struct InputCaptureState {
     modifier_state: XMods,
     /// cached natural-scrolling preference of this host
     natural_scroll: NaturalScrollCache,
+    /// capture handed to the producer via Grab but not applied yet; a forced
+    /// release clears it so a still-queued Grab cannot re-arm the capture
+    pending_grab: Option<Position>,
+    /// rate limit for starting captures
+    gate: CaptureGate,
+    /// recent `TapDisabledByTimeout` events
+    tap_timeouts: SlidingWindow,
 }
 
 #[derive(Debug)]
@@ -184,7 +275,6 @@ enum ProducerEvent {
     Create(Position),
     Destroy(Position),
     Grab(Position),
-    EventTapDisabled,
     DisplayReconfigured,
 }
 
@@ -197,6 +287,9 @@ impl InputCaptureState {
             bounds: Bounds::default(),
             modifier_state: Default::default(),
             natural_scroll: NaturalScrollCache::new(),
+            pending_grab: None,
+            gate: CaptureGate::default(),
+            tap_timeouts: SlidingWindow::default(),
         };
         res.update_bounds()?;
         Ok(res)
@@ -269,6 +362,15 @@ impl InputCaptureState {
         CGDisplay::show_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)
     }
 
+    /// Hand local input back right now, from the tap thread, without waiting
+    /// for the async side - which is exactly the part that may be stuck.
+    fn force_local_release(&mut self) {
+        self.pending_grab = None;
+        if self.current_pos.take().is_some() {
+            let _ = CGDisplay::show_cursor(&CGDisplay::main());
+        }
+    }
+
     async fn handle_producer_event(
         &mut self,
         producer_event: ProducerEvent,
@@ -279,24 +381,30 @@ impl InputCaptureState {
                 edge_ratio,
                 completed,
             } => {
-                if let Some(pos) = self.current_pos {
+                self.pending_grab = None;
+                // Clear the capture before anything that can fail: a cursor
+                // glitch is cosmetic, a capture left armed eats all input.
+                if let Some(pos) = self.current_pos.take() {
                     // place the cursor where the remote cursor crossed back
                     // over the barrier; point_on_edge keeps the warp target
                     // 1pt inside rather than exactly on the barrier
                     if let Some(ratio) = edge_ratio {
                         let target = point_on_edge(&self.bounds, pos, ratio);
-                        CGDisplay::warp_mouse_cursor_position(target)
-                            .map_err(CaptureError::WarpCursor)?;
+                        if let Err(e) = CGDisplay::warp_mouse_cursor_position(target) {
+                            log::warn!("failed to place cursor on release: {e}");
+                        }
                     }
-                    self.show_cursor()?;
-                    self.current_pos = None;
+                    self.show_cursor()
+                        .unwrap_or_else(|e| log::warn!("failed to show cursor: {e}"));
                 }
                 if let Some(completed) = completed {
                     let _ = completed.send(());
                 }
             }
             ProducerEvent::Grab(pos) => {
-                if self.current_pos.is_none() {
+                // ignore a Grab the tap has since revoked (forced release)
+                if self.pending_grab.take_if(|p| *p == pos).is_some() && self.current_pos.is_none()
+                {
                     self.hide_cursor()?;
                     self.current_pos = Some(pos);
                 }
@@ -305,24 +413,14 @@ impl InputCaptureState {
                 self.active_clients.insert(p);
             }
             ProducerEvent::Destroy(p) => {
-                if let Some(current) = self.current_pos {
-                    if current == p {
-                        self.show_cursor()?;
-                        self.current_pos = None;
-                    };
+                if self.pending_grab == Some(p) {
+                    self.pending_grab = None;
                 }
                 self.active_clients.remove(&p);
-            }
-            ProducerEvent::EventTapDisabled => {
-                // Tap death can happen mid-capture (TCC Accessibility
-                // revoked, tap-timeout, etc). Release state so we
-                // don't leave the cursor hidden even if the outer
-                // task only logs this error rather than propagating.
-                if self.current_pos.is_some() {
-                    self.show_cursor()?;
-                    self.current_pos = None;
+                if self.current_pos.take_if(|current| *current == p).is_some() {
+                    self.show_cursor()
+                        .unwrap_or_else(|e| log::warn!("failed to show cursor: {e}"));
                 }
-                return Err(CaptureError::EventTapDisabled);
             }
             ProducerEvent::DisplayReconfigured => {
                 // The macOS display configuration changed — a monitor
@@ -587,6 +685,7 @@ fn create_event_tap<'a>(
     client_state: Arc<Mutex<InputCaptureState>>,
     notify_tx: Sender<ProducerEvent>,
     event_tx: Sender<(Position, CaptureEvent)>,
+    fault_tx: UnboundedSender<CaptureError>,
 ) -> Result<CGEventTap<'a>, MacosCaptureCreationError> {
     // Shared slot for the tap's mach port pointer. Stored as `usize`
     // because raw pointers aren't `Send`, but the integer
@@ -613,26 +712,40 @@ fn create_event_tap<'a>(
         CGEventType::FlagsChanged,
     ];
 
+    // Invariant: nothing in this callback may wait on the async side. The
+    // window server holds every local input event until the callback returns,
+    // so a callback blocked on a full channel (or on a lock whose holder is
+    // blocked on one) freezes mouse and keyboard for the whole session. Every
+    // send is a `try_send`; when the pipeline cannot keep up, local input is
+    // handed back first and the failure is reported afterwards.
     let event_tap_callback = move |_proxy: CGEventTapProxy,
                                    event_type: CGEventType,
                                    cg_ev: &CGEvent| {
         log::trace!("Got event from tap: {event_type:?}");
         let mut state = client_state.blocking_lock();
+        let now = Instant::now();
         let mut capture_position = None;
         let mut res_events = vec![];
 
         if matches!(event_type, CGEventType::TapDisabledByTimeout) {
-            // The kernel disables the tap when our callback runs
-            // longer than ~1s on a single event — typical causes
-            // are heavy load, scheduler contention, or this
-            // process being briefly suspended (e.g. App Nap on a
-            // long idle). It is NOT a fatal condition: Apple's
-            // documented recovery is to call CGEventTapEnable
-            // and resume processing. Re-enable in place and KEEP
-            // existing capture state so the user doesn't see the
-            // cursor pop back to the local screen mid-session.
+            // The window server disables the tap when the callback does not
+            // answer in time (a stalled pipeline, heavy load, App Nap). Any
+            // capture that was active is suspect by now: give input back
+            // first, then re-enable as Apple documents - unless the tap keeps
+            // timing out, in which case staying disabled is the safe state.
+            state.force_local_release();
+            state.gate.block(now);
+            let timeouts = state.tap_timeouts.hit(now, TAP_TIMEOUT_WINDOW);
+            if timeouts > TAP_TIMEOUT_LIMIT {
+                log::error!(
+                    "CGEventTap timed out {timeouts} times within {TAP_TIMEOUT_WINDOW:?}, \
+                     leaving it disabled"
+                );
+                let _ = fault_tx.send(CaptureError::EventTapDisabled);
+                return CallbackResult::Keep;
+            }
             if let Some(&port) = tap_mach_port_cb.get() {
-                log::warn!("CGEventTap disabled by timeout — re-enabling");
+                log::warn!("CGEventTap disabled by timeout — local input released, re-enabling");
                 unsafe {
                     CGEventTapEnable(port as *mut c_void, true);
                 }
@@ -640,33 +753,20 @@ fn create_event_tap<'a>(
                 log::error!(
                     "CGEventTap disabled by timeout, but mach port not yet stored — cannot re-enable"
                 );
+                let _ = fault_tx.send(CaptureError::EventTapDisabled);
             }
             return CallbackResult::Keep;
         }
 
         if matches!(event_type, CGEventType::TapDisabledByUserInput) {
-            // Deliberate kill — secure-input mode (e.g. password
-            // field), TCC Accessibility revoked mid-session, or
-            // the user disabling event-monitoring. We can't
-            // recover from this; drop captured state synchronously
-            // and return Keep on this event. Otherwise the
-            // `current_pos.is_some()` branch below would drop this
-            // event (and any racing callback still in flight) back
-            // into `CallbackResult::Drop`, silently eating the
-            // user's clicks and keypresses while the tap winds
-            // down. Clear state + show the cursor here, then
-            // notify the producer loop so the service can tear
-            // down cleanly.
+            // Deliberate kill — secure-input mode (e.g. password field), TCC
+            // Accessibility revoked mid-session, or the user disabling
+            // event-monitoring. We can't recover from this: drop the capture
+            // synchronously so no racing callback keeps eating input, and let
+            // the service tear the session down.
             log::error!("CGEventTap disabled by user input, releasing capture state");
-            if state.current_pos.is_some() {
-                let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                state.current_pos = None;
-            }
-            notify_tx
-                .blocking_send(ProducerEvent::EventTapDisabled)
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to send notification: {e}");
-                });
+            state.force_local_release();
+            let _ = fault_tx.send(CaptureError::EventTapDisabled);
             return CallbackResult::Keep;
         }
 
@@ -687,9 +787,13 @@ fn create_event_tap<'a>(
             SyntheticEnterAction::ProcessNormally => {}
         }
 
+        let mut emergency_release = false;
+
         // Are we in a client?
         if let Some(current_pos) = state.current_pos {
             capture_position = Some(current_pos);
+            emergency_release = matches!(event_type, CGEventType::FlagsChanged)
+                && is_emergency_release_chord(cg_ev.get_flags());
             // reborrow through the guard so the field borrows can split
             let state = &mut *state;
             get_events(
@@ -713,63 +817,92 @@ fn create_event_tap<'a>(
             ) {
                 state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
             }
-        } else if matches!(event_type, CGEventType::MouseMoved) {
+        } else if matches!(event_type, CGEventType::MouseMoved) && state.pending_grab.is_none() {
             // Did we cross a barrier?
             if let Some(new_pos) = state.crossed(cg_ev) {
-                capture_position = Some(new_pos);
-                let ratio = match state.start_capture(cg_ev, new_pos) {
-                    Ok(ratio) => Some(ratio),
-                    Err(e) => {
-                        log::warn!("{e}");
-                        None
+                if state.gate.try_start(now) {
+                    match notify_tx.try_send(ProducerEvent::Grab(new_pos)) {
+                        Ok(()) => {
+                            state.pending_grab = Some(new_pos);
+                            capture_position = Some(new_pos);
+                            let ratio = match state.start_capture(cg_ev, new_pos) {
+                                Ok(ratio) => Some(ratio),
+                                Err(e) => {
+                                    log::warn!("{e}");
+                                    None
+                                }
+                            };
+                            res_events.push(CaptureEvent::Begin { ratio });
+                            let (depressed, locked) = modifier_masks(cg_ev.get_flags());
+                            state.modifier_state = depressed;
+                            res_events.push(CaptureEvent::Input(Event::Keyboard(
+                                KeyboardEvent::Modifiers {
+                                    depressed: depressed.bits(),
+                                    latched: 0,
+                                    locked: locked.bits(),
+                                    group: 0,
+                                },
+                            )));
+                        }
+                        Err(e) => {
+                            // the producer task is not keeping up; a capture
+                            // started now could not be released in time
+                            log::warn!("not starting capture, producer queue unavailable: {e}");
+                            state.gate.block(now);
+                        }
                     }
-                };
-                res_events.push(CaptureEvent::Begin { ratio });
-                let (depressed, locked) = modifier_masks(cg_ev.get_flags());
-                state.modifier_state = depressed;
-                res_events.push(CaptureEvent::Input(Event::Keyboard(
-                    KeyboardEvent::Modifiers {
-                        depressed: depressed.bits(),
-                        latched: 0,
-                        locked: locked.bits(),
-                        group: 0,
-                    },
-                )));
-                notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
+                }
             }
         }
 
-        if let Some(pos) = capture_position {
-            // Never hold the capture-state mutex while applying backpressure
-            // to the bounded event channel. Release/Destroy requests need the
-            // same mutex to restore local input; holding it across a blocking
-            // send can otherwise deadlock a full queue against release.
-            drop(state);
-            res_events.iter().for_each(|e| {
-                // error must be ignored, since the event channel
-                // may already be closed when the InputCapture instance is dropped.
-                #[cfg(feature = "metrics")]
-                let kind = crate::observability::event_kind(e);
-                let _result = event_tx.blocking_send((pos, *e));
-                #[cfg(feature = "metrics")]
-                if _result.is_ok() {
-                    const EVENT_CHANNEL_CAPACITY: usize = 32;
+        let Some(pos) = capture_position else {
+            return CallbackResult::Keep;
+        };
+
+        for e in &res_events {
+            #[cfg(feature = "metrics")]
+            let kind = crate::observability::event_kind(e);
+            match event_tx.try_send((pos, *e)) {
+                Ok(()) => {
+                    #[cfg(feature = "metrics")]
                     crate::observability::record_enqueued(
                         "macos_capture",
                         kind,
                         EVENT_CHANNEL_CAPACITY.saturating_sub(event_tx.capacity()),
                     );
                 }
-            });
-            // Returning Drop should stop the event from being processed
-            // but core fundation still returns the event
-            cg_ev.set_type(CGEventType::Null);
-            CallbackResult::Drop
-        } else {
-            CallbackResult::Keep
+                Err(TrySendError::Full(_)) => {
+                    // Nobody is consuming captured input any more. Holding on
+                    // would turn this Mac into an input black hole.
+                    log::error!(
+                        "input capture consumer stalled ({EVENT_CHANNEL_CAPACITY} events queued), \
+                         releasing local input"
+                    );
+                    state.force_local_release();
+                    state.gate.block(now);
+                    let _ = fault_tx.send(CaptureError::EventTapDisabled);
+                    return CallbackResult::Keep;
+                }
+                Err(TrySendError::Closed(_)) => {
+                    // the InputCapture instance is being dropped
+                    state.force_local_release();
+                    return CallbackResult::Keep;
+                }
+            }
         }
+
+        if emergency_release {
+            // The chord was forwarded above, so a healthy service releases
+            // the session normally; this makes it work for a hung one too.
+            log::warn!("release chord pressed, releasing local input");
+            state.force_local_release();
+            return CallbackResult::Keep;
+        }
+
+        // Returning Drop should stop the event from being processed
+        // but core fundation still returns the event
+        cg_ev.set_type(CGEventType::Null);
+        CallbackResult::Drop
     };
 
     let tap = CGEventTap::new(
@@ -804,13 +937,14 @@ fn event_tap_thread(
     client_state: Arc<Mutex<InputCaptureState>>,
     event_tx: Sender<(Position, CaptureEvent)>,
     notify_tx: Sender<ProducerEvent>,
+    fault_tx: UnboundedSender<CaptureError>,
     ready: std::sync::mpsc::Sender<Result<CFRunLoop, MacosCaptureCreationError>>,
     exit: oneshot::Sender<()>,
 ) {
     // Clone now: create_event_tap consumes notify_tx into its closure.
     let display_notify_tx = notify_tx.clone();
 
-    let _tap = match create_event_tap(client_state, notify_tx, event_tx) {
+    let _tap = match create_event_tap(client_state, notify_tx, event_tx, fault_tx) {
         Err(e) => {
             ready.send(Err(e)).expect("channel closed");
             return;
@@ -872,13 +1006,19 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
     // freed. The callback only fires while the run loop is running
     // on that thread, so we know the box is live here.
     let sender = unsafe { &*(user_info as *const Sender<ProducerEvent>) };
-    if let Err(e) = sender.blocking_send(ProducerEvent::DisplayReconfigured) {
+    // This runs on the event tap's run loop: blocking here would stall the
+    // tap and with it all local input. A dropped notification only delays
+    // the bounds refresh.
+    if let Err(e) = sender.try_send(ProducerEvent::DisplayReconfigured) {
         log::warn!("failed to notify display reconfiguration: {e}");
     }
 }
 
 pub struct MacOSInputCapture {
     event_rx: Receiver<(Position, CaptureEvent)>,
+    /// failures detected on the tap thread; the tap has already given local
+    /// input back when one arrives, the service still has to end the session
+    fault_rx: UnboundedReceiver<CaptureError>,
     notify_tx: Sender<ProducerEvent>,
     run_loop: CFRunLoop,
 }
@@ -888,8 +1028,9 @@ impl MacOSInputCapture {
         request_macos_capture_permissions()?;
 
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
-        let (event_tx, event_rx) = mpsc::channel(32);
-        let (notify_tx, mut notify_rx) = mpsc::channel(32);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (notify_tx, mut notify_rx) = mpsc::channel(NOTIFY_CHANNEL_CAPACITY);
+        let (fault_tx, fault_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
 
@@ -903,6 +1044,7 @@ impl MacOSInputCapture {
                 event_tap_thread_state,
                 event_tx,
                 event_tap_notify,
+                fault_tx,
                 ready_tx,
                 tap_exit_tx,
             )
@@ -932,6 +1074,7 @@ impl MacOSInputCapture {
 
         Ok(Self {
             event_rx,
+            fault_rx,
             notify_tx,
             run_loop,
         })
@@ -1037,6 +1180,10 @@ impl Stream for MacOSInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // faults first: events queued before one are stale
+        if let Poll::Ready(Some(error)) = self.fault_rx.poll_recv(cx) {
+            return Poll::Ready(Some(Err(error)));
+        }
         match ready!(self.event_rx.poll_recv(cx)) {
             None => Poll::Ready(None),
             Some(e) => {
@@ -1130,12 +1277,14 @@ bitflags! {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bounds, CROSSDESK_ENTER_EVENT_TAG, Position, SyntheticEnterAction, XMods,
-        cg_line_scroll_to_wire, edge_ratio, modifier_key_events, modifier_masks, point_on_edge,
+        Bounds, CAPTURE_COOLDOWN, CAPTURE_STORM_LIMIT, CROSSDESK_ENTER_EVENT_TAG, CaptureGate,
+        Position, SlidingWindow, SyntheticEnterAction, XMods, cg_line_scroll_to_wire, edge_ratio,
+        is_emergency_release_chord, modifier_key_events, modifier_masks, point_on_edge,
         synthetic_enter_action,
     };
     use core_graphics::event::CGEventFlags;
     use input_event::{KeyboardEvent, scancode};
+    use std::time::{Duration, Instant};
 
     const BOUNDS: Bounds = Bounds {
         xmin: 0.0,
@@ -1225,6 +1374,63 @@ mod tests {
         assert_eq!(cg_line_scroll_to_wire(1, false), -1);
         assert_eq!(cg_line_scroll_to_wire(-1, false), 1);
         assert_eq!(cg_line_scroll_to_wire(0, false), 0);
+    }
+
+    #[test]
+    fn sliding_window_forgets_old_hits() {
+        let start = Instant::now();
+        let window = Duration::from_secs(2);
+        let mut hits = SlidingWindow::default();
+        assert_eq!(hits.hit(start, window), 1);
+        assert_eq!(hits.hit(start + Duration::from_secs(1), window), 2);
+        assert_eq!(hits.hit(start + Duration::from_secs(4), window), 1);
+    }
+
+    #[test]
+    fn capture_storm_pauses_new_captures() {
+        let start = Instant::now();
+        let mut gate = CaptureGate::default();
+        for i in 0..CAPTURE_STORM_LIMIT {
+            assert!(gate.try_start(start + Duration::from_millis(i as u64)));
+        }
+        assert!(!gate.try_start(start + Duration::from_millis(100)));
+        assert!(!gate.try_start(start + CAPTURE_COOLDOWN));
+        assert!(gate.try_start(start + CAPTURE_COOLDOWN + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn human_paced_crossings_are_never_throttled() {
+        let start = Instant::now();
+        let mut gate = CaptureGate::default();
+        for i in 0..100 {
+            assert!(gate.try_start(start + Duration::from_millis(300 * i)));
+        }
+    }
+
+    #[test]
+    fn blocked_gate_reopens_after_cooldown() {
+        let start = Instant::now();
+        let mut gate = CaptureGate::default();
+        gate.block(start);
+        assert!(!gate.try_start(start + Duration::from_secs(1)));
+        assert!(gate.try_start(start + CAPTURE_COOLDOWN));
+    }
+
+    #[test]
+    fn emergency_chord_needs_all_four_modifiers() {
+        let all = CGEventFlags::CGEventFlagControl
+            | CGEventFlags::CGEventFlagShift
+            | CGEventFlags::CGEventFlagAlternate
+            | CGEventFlags::CGEventFlagCommand;
+        assert!(is_emergency_release_chord(all));
+        assert!(is_emergency_release_chord(
+            all | CGEventFlags::CGEventFlagAlphaShift
+        ));
+        assert!(!is_emergency_release_chord(
+            CGEventFlags::CGEventFlagControl
+                | CGEventFlags::CGEventFlagShift
+                | CGEventFlags::CGEventFlagCommand
+        ));
     }
 
     #[test]
